@@ -19,7 +19,7 @@ from aiogram.exceptions import TelegramAPIError
 # ==================================================
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
-CHAT_ID = int(os.getenv("CHAT_ID", "-1004384102181"))
+CHAT_ID = int(os.getenv("CHAT_ID", "-1004398264709"))
 PORT = int(os.getenv("PORT", "8080"))
 INTERVAL_SECONDS = 60
 
