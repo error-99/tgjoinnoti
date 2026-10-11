@@ -17,7 +17,7 @@ from aiogram.exceptions import TelegramAPIError
 # আপনার দেওয়া টোকেন সরাসরি এখানে বসানো হয়েছে
 BOT_TOKEN = "6909332823:AAGLjKeoofZks57OYkPCywwQ8hZNJym8Umg"
 CHAT_ID = int(os.getenv("CHAT_ID", "-1004398264709"))
-INTERVAL_SECONDS = 60
+INTERVAL_SECONDS = 240
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("tgjoinnoti")
