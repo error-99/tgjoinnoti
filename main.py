@@ -1,5 +1,6 @@
 import asyncio
 import html
+import json
 import logging
 import os
 from urllib.parse import quote
@@ -14,10 +15,13 @@ from aiogram.exceptions import TelegramAPIError
 # ==================================================
 # CONFIGURATION
 # ==================================================
-# আপনার দেওয়া টোকেন সরাসরি এখানে বসানো হয়েছে
-BOT_TOKEN = "6909332823:AAGLjKeoofZks57OYkPCywwQ8hZNJym8Umg"
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN environment variable is not set")
+
 CHAT_ID = int(os.getenv("CHAT_ID", "-1004398264709"))
 INTERVAL_SECONDS = 240
+STATE_FILE = "last_member.json"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("tgjoinnoti")
@@ -28,11 +32,35 @@ dp = Dispatcher()
 # STATE VARIABLES
 # ==================================================
 previous_message_id = None
-member_name_html = "বন্ধু"
+member_name_html = "বন্ধু"          # default
 group_invite_link = None
 
 member_join_event = asyncio.Event()
 replace_lock = asyncio.Lock()
+
+
+# ==================================================
+# PERSISTENCE
+# ==================================================
+def save_last_member(name_html: str):
+    """Save the last joined member's HTML name to a JSON file."""
+    try:
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump({"member_name_html": name_html}, f, ensure_ascii=False)
+    except Exception as e:
+        log.warning(f"Could not save state: {e}")
+
+def load_last_member() -> str:
+    """Load the last joined member's HTML name from the JSON file."""
+    if not os.path.exists(STATE_FILE):
+        return "বন্ধু"
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return data.get("member_name_html", "বন্ধু")
+    except Exception as e:
+        log.warning(f"Could not load state: {e}")
+        return "বন্ধু"
 
 
 # ==================================================
@@ -55,20 +83,21 @@ def make_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="📤 শেয়ার ২/৩ করুন", url=share_url)],
-            [InlineKeyboardButton(text="🎥 ভিডিও দেখুন", url=share_url)]
+            [InlineKeyboardButton(text="🎥 ভিডিও দেখুন", url=share_url)]  # change this URL if you have a real video link
         ]
     )
 
-def make_message() -> str:
+def make_message(name_html: str = None) -> str:
+    name = name_html or member_name_html
     return (
-        f"প্রিয় {member_name_html}, আপনাকে "
+        f"প্রিয় {name}, আপনাকে "
         "হিজাবি ভিডিওগ্রুপে জয়েন হওয়ার জন্য ধন্যবাদ। ❤️\n\n"
         "হিজাবি ভিডিওগ্রুপে ভিডিও দেখতে লিংকটি "
         "৩টি গ্রুপে শেয়ার করুন। "
         "৩টি গ্রুপে শেয়ার করলে ভিডিওটি আনলক হবে।"
     )
 
-async def replace_message(bot: Bot):
+async def replace_message(bot: Bot, name_html: str = None):
     global previous_message_id
 
     async with replace_lock:
@@ -81,7 +110,11 @@ async def replace_message(bot: Bot):
                 log.warning(f"Could not delete old message: {exc}")
 
         try:
-            sent = await bot.send_message(chat_id=CHAT_ID, text=make_message(), reply_markup=make_keyboard())
+            sent = await bot.send_message(
+                chat_id=CHAT_ID,
+                text=make_message(name_html),
+                reply_markup=make_keyboard()
+            )
             previous_message_id = sent.message_id
             log.info(f"Promotion sent; message_id={previous_message_id}")
         except Exception as exc:
@@ -99,10 +132,11 @@ async def new_member_handler(event: ChatMemberUpdated, bot: Bot):
         return
 
     member_name_html = f'<a href="tg://user?id={user.id}">{html.escape(user.full_name)}</a>'
+    save_last_member(member_name_html)
     log.info(f"New group member: {user.full_name}")
-    
+
     member_join_event.set()
-    await replace_message(bot)
+    await replace_message(bot, member_name_html)
 
 async def refresh_loop(bot: Bot):
     while True:
@@ -118,7 +152,11 @@ async def refresh_loop(bot: Bot):
 # APP STARTUP
 # ==================================================
 async def main():
-    global group_invite_link
+    global group_invite_link, member_name_html
+
+    # Load last joined member from file
+    member_name_html = load_last_member()
+    log.info(f"Loaded last member: {member_name_html}")
 
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     
@@ -129,7 +167,8 @@ async def main():
         
         group_invite_link = await get_group_link(bot)
         
-        await replace_message(bot)
+        # Send the welcome message on startup using the saved member name
+        await replace_message(bot, member_name_html)
 
         await asyncio.gather(
             dp.start_polling(bot, allowed_updates=["message", "chat_member"]),
