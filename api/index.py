@@ -1,5 +1,6 @@
 """
 Single-file Telegram bot — aiogram 3 + FastAPI on Vercel.
+Nice inline-button admin panel (no slash commands needed).
 
 Endpoints:
   POST /api/webhook   ← Telegram updates
@@ -25,10 +26,12 @@ from aiogram.filters.chat_member_updated import (
     ChatMemberUpdatedFilter, IS_MEMBER, IS_NOT_MEMBER,
 )
 from aiogram.types import (
-    Message, ChatMemberUpdated, Update,
-    InlineKeyboardMarkup, InlineKeyboardButton,
-    BotCommand,
+    Message, ChatMemberUpdated, Update, CallbackQuery,
+    InlineKeyboardMarkup, InlineKeyboardButton, BotCommand,
 )
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.exceptions import TelegramAPIError
 
 from upstash_redis.asyncio import Redis
@@ -73,7 +76,7 @@ def create_bot() -> Bot:
     return Bot(token=BOT_TOKEN,
                default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 
-dp = Dispatcher()
+dp = Dispatcher(storage=MemoryStorage())
 
 # ======================================================================
 # CONFIG HELPERS (Redis-backed)
@@ -198,8 +201,11 @@ async def refresh_all(bot: Bot, cfg: dict, name_html: str | None = None) -> dict
     return out
 
 # ======================================================================
-# HELPERS
+# FSM
 # ======================================================================
+class AdminFlow(StatesGroup):
+    waiting_value = State()
+
 def _args(message: Message) -> str:
     parts = (message.text or "").split(maxsplit=1)
     return parts[1] if len(parts) > 1 else ""
@@ -213,7 +219,7 @@ def admin_only(func):
     return wrapper
 
 # ======================================================================
-# USER HANDLERS
+# USER HANDLER
 # ======================================================================
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
@@ -237,261 +243,367 @@ async def cmd_start(message: Message):
         log.error(f"/start error: {e}")
 
 # ======================================================================
-# ADMIN HANDLERS
+# ADMIN PANEL — MAIN MENU
 # ======================================================================
+def main_panel(cfg: dict) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"📢 Targets ({len(cfg['targets'])})",
+                              callback_data="menu:targets")],
+        [InlineKeyboardButton(text=f"🎯 Triggers ({len(cfg['trigger_chat_ids'])})",
+                              callback_data="menu:triggers")],
+        [InlineKeyboardButton(text="💬 Message", callback_data="menu:message")],
+        [InlineKeyboardButton(text=f"🔘 Buttons ({len(cfg['buttons'])})",
+                              callback_data="menu:buttons")],
+        [InlineKeyboardButton(text="⚙️ Settings", callback_data="menu:settings")],
+        [InlineKeyboardButton(text="👁 Preview", callback_data="action:preview"),
+         InlineKeyboardButton(text="🔄 Refresh Now", callback_data="action:refresh")],
+        [InlineKeyboardButton(text="📊 Status", callback_data="action:status")],
+    ])
+
+
 @dp.message(Command("admin"))
-@admin_only
-async def cmd_admin(message: Message):
+async def cmd_admin(message: Message, state: FSMContext):
+    if not await is_admin(message.from_user.id):
+        return await message.answer("⛔ You are not an admin.")
+    await state.clear()
+    cfg = await get_config()
     await message.answer(
-        "🤖 <b>Admin Panel</b>\n\n"
-        "<b>Targets (channels/groups):</b>\n"
-        "/targets — list\n"
-        "/add_target &lt;chat_id&gt;\n"
-        "/remove_target &lt;chat_id&gt;\n\n"
-        "<b>Trigger chats (watch for joins):</b>\n"
-        "/add_trigger &lt;chat_id&gt;\n"
-        "/remove_trigger &lt;chat_id&gt;\n\n"
-        "<b>Message:</b>\n"
-        "/set_message &lt;text with {name}&gt;\n"
-        "/get_message   /preview\n\n"
-        "<b>Buttons:</b>\n"
-        "/buttons\n"
-        "/add_button &lt;text&gt; | &lt;url&gt;\n"
-        "/add_share_button &lt;text&gt;\n"
-        "/remove_button &lt;index&gt;\n\n"
-        "<b>Settings:</b>\n"
-        "/set_interval &lt;seconds&gt;\n"
-        "/set_share_text &lt;text&gt;\n"
-        "/set_share_chat &lt;chat_id&gt;\n"
-        "/refresh   /status   /add_admin &lt;user_id&gt;"
+        "🛠 <b>Admin Panel</b>\nTap a category below:",
+        reply_markup=main_panel(cfg),
     )
 
-@dp.message(Command("add_admin"))
-@admin_only
-async def cmd_add_admin(message: Message):
-    try:
-        uid = int(_args(message).strip())
-    except ValueError:
-        return await message.answer("Usage: /add_admin <user_id>")
-    cfg = await get_config()
-    if uid not in cfg["extra_admin_ids"]:
-        cfg["extra_admin_ids"].append(uid)
-        await save_config(cfg)
-    await message.answer(f"✅ Added admin <code>{uid}</code>")
 
-@dp.message(Command("targets"))
-@admin_only
-async def cmd_targets(message: Message):
+@dp.callback_query(lambda c: c.data == "menu:home")
+async def cb_home(call: CallbackQuery, state: FSMContext):
+    if not await is_admin(call.from_user.id):
+        return await call.answer("Not admin", show_alert=True)
+    await state.clear()
     cfg = await get_config()
-    if not cfg["targets"]:
-        return await message.answer("No targets. Use /add_target <chat_id>")
-    lines = ["<b>Targets:</b>"]
-    for i, t in enumerate(cfg["targets"], 1):
-        lines.append(f"{i}. <code>{t['chat_id']}</code> — {t.get('title','?')}")
-    await message.answer("\n".join(lines))
+    await call.message.edit_text(
+        "🛠 <b>Admin Panel</b>\nTap a category below:",
+        reply_markup=main_panel(cfg),
+    )
+    await call.answer()
 
-@dp.message(Command("add_target"))
-@admin_only
-async def cmd_add_target(message: Message):
-    try:
-        chat_id = int(_args(message).strip())
-    except ValueError:
-        return await message.answer("Usage: /add_target <chat_id>")
-    try:
-        chat = await message.bot.get_chat(chat_id)
-    except Exception as e:
-        return await message.answer(f"❌ Cannot access: {e}")
+# ======================================================================
+# ADMIN PANEL — TARGETS
+# ======================================================================
+@dp.callback_query(lambda c: c.data == "menu:targets")
+async def cb_targets(call: CallbackQuery):
+    if not await is_admin(call.from_user.id):
+        return await call.answer("Not admin", show_alert=True)
     cfg = await get_config()
-    if any(t["chat_id"] == chat_id for t in cfg["targets"]):
-        return await message.answer("⚠️ Already added")
-    cfg["targets"].append({"chat_id": chat_id, "title": chat.title or str(chat_id), "type": chat.type})
-    await save_config(cfg)
-    await message.answer(f"✅ Added target: {chat.title} (<code>{chat_id}</code>)")
+    rows = []
+    for t in cfg["targets"]:
+        rows.append([InlineKeyboardButton(
+            text=f"❌ {t.get('title','?')} ({t['chat_id']})",
+            callback_data=f"del_target:{t['chat_id']}")])
+    rows.append([InlineKeyboardButton(text="➕ Add Target", callback_data="ask:add_target")])
+    rows.append([InlineKeyboardButton(text="⬅ Back", callback_data="menu:home")])
+    await call.message.edit_text(
+        "<b>📢 Targets</b>\nChannels/groups the promotion is posted to.\n\n"
+        "Tap a target to remove it, or add a new one:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+    await call.answer()
 
-@dp.message(Command("remove_target"))
-@admin_only
-async def cmd_remove_target(message: Message):
-    try:
-        chat_id = int(_args(message).strip())
-    except ValueError:
-        return await message.answer("Usage: /remove_target <chat_id>")
+
+@dp.callback_query(lambda c: c.data.startswith("del_target:"))
+async def cb_del_target(call: CallbackQuery):
+    if not await is_admin(call.from_user.id):
+        return await call.answer("Not admin", show_alert=True)
+    chat_id = int(call.data.split(":", 1)[1])
     cfg = await get_config()
-    before = len(cfg["targets"])
     cfg["targets"] = [t for t in cfg["targets"] if t["chat_id"] != chat_id]
     await save_config(cfg)
-    await message.answer("✅ Removed" if len(cfg["targets"]) < before else "⚠️ Not found")
+    await call.answer("✅ Removed")
+    await cb_targets(call)
 
-@dp.message(Command("add_trigger"))
-@admin_only
-async def cmd_add_trigger(message: Message):
-    try:
-        chat_id = int(_args(message).strip())
-    except ValueError:
-        return await message.answer("Usage: /add_trigger <chat_id>")
+# ======================================================================
+# ADMIN PANEL — TRIGGERS
+# ======================================================================
+@dp.callback_query(lambda c: c.data == "menu:triggers")
+async def cb_triggers(call: CallbackQuery):
+    if not await is_admin(call.from_user.id):
+        return await call.answer("Not admin", show_alert=True)
     cfg = await get_config()
-    if chat_id not in cfg["trigger_chat_ids"]:
-        cfg["trigger_chat_ids"].append(chat_id)
-        await save_config(cfg)
-    await message.answer(f"✅ Trigger chat <code>{chat_id}</code> added")
+    rows = []
+    for cid in cfg["trigger_chat_ids"]:
+        rows.append([InlineKeyboardButton(
+            text=f"❌ {cid}", callback_data=f"del_trigger:{cid}")])
+    rows.append([InlineKeyboardButton(text="➕ Add Trigger Chat", callback_data="ask:add_trigger")])
+    rows.append([InlineKeyboardButton(text="⬅ Back", callback_data="menu:home")])
+    await call.message.edit_text(
+        "<b>🎯 Trigger Chats</b>\nChats where the bot watches for new members.\n\n"
+        "Tap one to remove, or add a new one:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+    await call.answer()
 
-@dp.message(Command("remove_trigger"))
-@admin_only
-async def cmd_remove_trigger(message: Message):
-    try:
-        chat_id = int(_args(message).strip())
-    except ValueError:
-        return await message.answer("Usage: /remove_trigger <chat_id>")
+
+@dp.callback_query(lambda c: c.data.startswith("del_trigger:"))
+async def cb_del_trigger(call: CallbackQuery):
+    if not await is_admin(call.from_user.id):
+        return await call.answer("Not admin", show_alert=True)
+    chat_id = int(call.data.split(":", 1)[1])
     cfg = await get_config()
     if chat_id in cfg["trigger_chat_ids"]:
         cfg["trigger_chat_ids"].remove(chat_id)
         await save_config(cfg)
-    await message.answer("✅ Removed")
+    await call.answer("✅ Removed")
+    await cb_triggers(call)
 
-@dp.message(Command("set_message"))
-@admin_only
-async def cmd_set_message(message: Message):
-    body = _args(message)
-    if not body.strip():
-        return await message.answer("Usage: /set_message <text with {name}>")
+# ======================================================================
+# ADMIN PANEL — MESSAGE
+# ======================================================================
+@dp.callback_query(lambda c: c.data == "menu:message")
+async def cb_message(call: CallbackQuery):
+    if not await is_admin(call.from_user.id):
+        return await call.answer("Not admin", show_alert=True)
     cfg = await get_config()
-    cfg["message_template"] = body
-    await save_config(cfg)
-    await message.answer("✅ Message updated")
+    text = cfg["message_template"]
+    preview = text.replace("{name}", "👤 User")[:200]
+    suffix = "…" if len(text) > 200 else ""
+    await call.message.edit_text(
+        f"<b>💬 Message Template</b>\n\n{preview}{suffix}"
+        "\n\nUse <code>{name}</code> for the new member's mention.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✏️ Edit Message", callback_data="ask:edit_message")],
+            [InlineKeyboardButton(text="👁 Preview", callback_data="action:preview")],
+            [InlineKeyboardButton(text="⬅ Back", callback_data="menu:home")],
+        ]),
+    )
+    await call.answer()
 
-@dp.message(Command("get_message"))
-@admin_only
-async def cmd_get_message(message: Message):
+# ======================================================================
+# ADMIN PANEL — BUTTONS
+# ======================================================================
+@dp.callback_query(lambda c: c.data == "menu:buttons")
+async def cb_buttons(call: CallbackQuery):
+    if not await is_admin(call.from_user.id):
+        return await call.answer("Not admin", show_alert=True)
     cfg = await get_config()
-    await message.answer(f"<b>Current:</b>\n\n{cfg['message_template']}")
+    rows = []
+    for i, b in enumerate(cfg["buttons"], 1):
+        tag = "📤" if b.get("type") == "share" else "🔗"
+        rows.append([InlineKeyboardButton(
+            text=f"❌ {tag} {b['text']}"[:60],
+            callback_data=f"del_button:{i}")])
+    rows.append([
+        InlineKeyboardButton(text="➕ Share Button", callback_data="ask:add_share_button"),
+        InlineKeyboardButton(text="➕ URL Button",   callback_data="ask:add_url_button"),
+    ])
+    rows.append([InlineKeyboardButton(text="⬅ Back", callback_data="menu:home")])
+    await call.message.edit_text(
+        "<b>🔘 Buttons</b>\nTap to remove, or add a new one:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+    await call.answer()
 
-@dp.message(Command("preview"))
-@admin_only
-async def cmd_preview(message: Message):
+
+@dp.callback_query(lambda c: c.data.startswith("del_button:"))
+async def cb_del_button(call: CallbackQuery):
+    if not await is_admin(call.from_user.id):
+        return await call.answer("Not admin", show_alert=True)
+    idx = int(call.data.split(":", 1)[1])
+    cfg = await get_config()
+    if 1 <= idx <= len(cfg["buttons"]):
+        cfg["buttons"].pop(idx - 1)
+        await save_config(cfg)
+    await call.answer("✅ Removed")
+    await cb_buttons(call)
+
+# ======================================================================
+# ADMIN PANEL — SETTINGS
+# ======================================================================
+@dp.callback_query(lambda c: c.data == "menu:settings")
+async def cb_settings(call: CallbackQuery):
+    if not await is_admin(call.from_user.id):
+        return await call.answer("Not admin", show_alert=True)
+    cfg = await get_config()
+    await call.message.edit_text(
+        "<b>⚙️ Settings</b>\n\n"
+        f"⏱ Interval: <b>{cfg['interval_seconds']}s</b>\n"
+        f"📤 Share text: <i>{escape(cfg.get('share_text','')[:80])}</i>\n"
+        f"🔗 Share source chat: <code>{cfg.get('share_chat_id') or 'auto'}</code>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⏱ Change Interval", callback_data="ask:interval")],
+            [InlineKeyboardButton(text="✏️ Change Share Text", callback_data="ask:share_text")],
+            [InlineKeyboardButton(text="🔗 Set Share Source Chat", callback_data="ask:share_chat")],
+            [InlineKeyboardButton(text="⬅ Back", callback_data="menu:home")],
+        ]),
+    )
+    await call.answer()
+
+# ======================================================================
+# ADMIN PANEL — ACTIONS
+# ======================================================================
+@dp.callback_query(lambda c: c.data == "action:preview")
+async def cb_preview(call: CallbackQuery):
+    if not await is_admin(call.from_user.id):
+        return await call.answer("Not admin", show_alert=True)
     cfg = await get_config()
     try:
-        share_link = await get_share_link(message.bot, cfg)
-        await message.answer(
-            "<b>Preview:</b>\n\n" + format_message(cfg, mention_html(message.from_user)),
+        share_link = await get_share_link(call.bot, cfg)
+        await call.message.answer(
+            "<b>👁 Preview:</b>\n\n" + format_message(cfg, mention_html(call.from_user)),
             reply_markup=build_keyboard(cfg, share_link),
         )
     except Exception as e:
-        await message.answer(f"❌ {e}")
+        await call.message.answer(f"❌ {e}")
+    await call.answer()
 
-@dp.message(Command("buttons"))
-@admin_only
-async def cmd_buttons(message: Message):
-    cfg = await get_config()
-    if not cfg["buttons"]:
-        return await message.answer("No buttons.")
-    lines = ["<b>Buttons:</b>"]
-    for i, b in enumerate(cfg["buttons"], 1):
-        if b.get("type") == "share":
-            lines.append(f"{i}. [share] {b['text']}")
-        else:
-            lines.append(f"{i}. [url] {b['text']} → {b.get('url','')}")
-    await message.answer("\n".join(lines))
 
-@dp.message(Command("add_button"))
-@admin_only
-async def cmd_add_button(message: Message):
-    body = _args(message)
-    if "|" not in body:
-        return await message.answer("Usage: /add_button <text> | <url>")
-    text, url = (x.strip() for x in body.split("|", 1))
-    if not text or not url:
-        return await message.answer("❌ Both required")
+@dp.callback_query(lambda c: c.data == "action:refresh")
+async def cb_refresh(call: CallbackQuery):
+    if not await is_admin(call.from_user.id):
+        return await call.answer("Not admin", show_alert=True)
     cfg = await get_config()
-    cfg["buttons"].append({"text": text, "type": "url", "url": url})
-    await save_config(cfg)
-    await message.answer(f"✅ Added: {text}")
-
-@dp.message(Command("add_share_button"))
-@admin_only
-async def cmd_add_share_button(message: Message):
-    body = _args(message).strip()
-    if not body:
-        return await message.answer("Usage: /add_share_button <text>")
-    cfg = await get_config()
-    cfg["buttons"].append({"text": body, "type": "share", "url": None})
-    await save_config(cfg)
-    await message.answer(f"✅ Added share button: {body}")
-
-@dp.message(Command("remove_button"))
-@admin_only
-async def cmd_remove_button(message: Message):
-    try:
-        idx = int(_args(message).strip())
-    except ValueError:
-        return await message.answer("Usage: /remove_button <index>")
-    cfg = await get_config()
-    if idx < 1 or idx > len(cfg["buttons"]):
-        return await message.answer("❌ Out of range")
-    removed = cfg["buttons"].pop(idx - 1)
-    await save_config(cfg)
-    await message.answer(f"✅ Removed: {removed['text']}")
-
-@dp.message(Command("set_interval"))
-@admin_only
-async def cmd_set_interval(message: Message):
-    try:
-        sec = int(_args(message).strip())
-        if sec < 30:
-            raise ValueError
-    except ValueError:
-        return await message.answer("Usage: /set_interval <seconds> (min 30)")
-    cfg = await get_config()
-    cfg["interval_seconds"] = sec
-    await save_config(cfg)
-    await message.answer(f"✅ Interval = {sec}s")
-
-@dp.message(Command("set_share_text"))
-@admin_only
-async def cmd_set_share_text(message: Message):
-    body = _args(message).strip()
-    if not body:
-        return await message.answer("Usage: /set_share_text <text>")
-    cfg = await get_config()
-    cfg["share_text"] = body
-    await save_config(cfg)
-    await message.answer("✅ Share text updated")
-
-@dp.message(Command("set_share_chat"))
-@admin_only
-async def cmd_set_share_chat(message: Message):
-    try:
-        chat_id = int(_args(message).strip())
-    except ValueError:
-        return await message.answer("Usage: /set_share_chat <chat_id>")
-    cfg = await get_config()
-    cfg["share_chat_id"] = chat_id
-    await save_config(cfg)
-    await clear_cached_share_link()
-    await message.answer(f"✅ Share source = {chat_id}")
-
-@dp.message(Command("status"))
-@admin_only
-async def cmd_status(message: Message):
-    cfg = await get_config()
-    await message.answer(
-        "<b>Status</b>\n"
-        f"Triggers: {len(cfg['trigger_chat_ids'])}\n"
-        f"Targets:  {len(cfg['targets'])}\n"
-        f"Buttons:  {len(cfg['buttons'])}\n"
-        f"Interval: {cfg['interval_seconds']}s\n"
-        f"Last member: {cfg.get('last_member_name','?')}\n"
-        f"Share chat: {cfg.get('share_chat_id') or 'auto'}"
-    )
-
-@dp.message(Command("refresh"))
-@admin_only
-async def cmd_refresh(message: Message):
-    cfg = await get_config()
-    res = await refresh_all(message.bot, cfg)
+    await call.answer("🔄 Refreshing…")
+    res = await refresh_all(call.bot, cfg)
     ok = sum(1 for v in res.values() if v)
-    await message.answer(f"🔄 Refreshed {ok}/{len(res)} targets")
+    await call.message.answer(f"🔄 Refreshed {ok}/{len(res)} targets")
+
+
+@dp.callback_query(lambda c: c.data == "action:status")
+async def cb_status(call: CallbackQuery):
+    if not await is_admin(call.from_user.id):
+        return await call.answer("Not admin", show_alert=True)
+    cfg = await get_config()
+    await call.message.answer(
+        "<b>📊 Status</b>\n"
+        f"🎯 Triggers: {len(cfg['trigger_chat_ids'])}\n"
+        f"📢 Targets:  {len(cfg['targets'])}\n"
+        f"🔘 Buttons:  {len(cfg['buttons'])}\n"
+        f"⏱ Interval: {cfg['interval_seconds']}s\n"
+        f"👤 Last member: {cfg.get('last_member_name','?')}\n"
+        f"🔗 Share chat: {cfg.get('share_chat_id') or 'auto'}"
+    )
+    await call.answer()
 
 # ======================================================================
-# EVENT: new member
+# ADMIN PANEL — ASK PROMPTS
+# ======================================================================
+ASK_PROMPTS = {
+    "add_target":       ("📢 Send the target chat ID\n(e.g. <code>-1001234567890</code>)", "add_target"),
+    "add_trigger":      ("🎯 Send the trigger chat ID\n(e.g. <code>-1001234567890</code>)", "add_trigger"),
+    "edit_message":     ("💬 Send the new message.\nUse <code>{name}</code> for the mention.", "edit_message"),
+    "add_share_button": ("📤 Send the button text (e.g. <b>📤 শেয়ার করুন</b>)", "add_share_button"),
+    "add_url_button":   ("🔗 Send: <b>text | url</b>\nExample:\n<code>🎥 Watch | https://youtube.com/x</code>", "add_url_button"),
+    "interval":         ("⏱ Send interval in seconds (min 30)", "interval"),
+    "share_text":       ("✏️ Send the new share text", "share_text"),
+    "share_chat":       ("🔗 Send chat ID whose invite link is shared", "share_chat"),
+}
+
+
+@dp.callback_query(lambda c: c.data.startswith("ask:"))
+async def cb_ask(call: CallbackQuery, state: FSMContext):
+    if not await is_admin(call.from_user.id):
+        return await call.answer("Not admin", show_alert=True)
+    key = call.data.split(":", 1)[1]
+    prompt, action = ASK_PROMPTS[key]
+    await state.set_state(AdminFlow.waiting_value)
+    await state.update_data(action=action)
+    await call.message.answer(
+        prompt,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✖️ Cancel", callback_data="menu:home")]
+        ]),
+    )
+    await call.answer()
+
+# ======================================================================
+# ADMIN PANEL — INPUT HANDLER
+# ======================================================================
+@dp.message(AdminFlow.waiting_value)
+async def on_admin_input(message: Message, state: FSMContext):
+    if not await is_admin(message.from_user.id):
+        return
+    data = await state.get_data()
+    action = data.get("action")
+    text = (message.text or "").strip()
+    await state.clear()
+
+    cfg = await get_config()
+
+    try:
+        if action == "add_target":
+            chat_id = int(text)
+            chat = await message.bot.get_chat(chat_id)
+            if any(t["chat_id"] == chat_id for t in cfg["targets"]):
+                return await message.answer("⚠️ Already added")
+            cfg["targets"].append({
+                "chat_id": chat_id,
+                "title": chat.title or str(chat_id),
+                "type": chat.type,
+            })
+            await save_config(cfg)
+            await message.answer(f"✅ Target added: <b>{escape(chat.title or str(chat_id))}</b>")
+
+        elif action == "add_trigger":
+            chat_id = int(text)
+            if chat_id in cfg["trigger_chat_ids"]:
+                return await message.answer("⚠️ Already added")
+            cfg["trigger_chat_ids"].append(chat_id)
+            await save_config(cfg)
+            await message.answer(f"✅ Trigger added: <code>{chat_id}</code>")
+
+        elif action == "edit_message":
+            if not text:
+                return await message.answer("❌ Empty message")
+            cfg["message_template"] = text
+            await save_config(cfg)
+            await message.answer("✅ Message updated")
+
+        elif action == "add_share_button":
+            if not text:
+                return await message.answer("❌ Empty")
+            cfg["buttons"].append({"text": text, "type": "share", "url": None})
+            await save_config(cfg)
+            await message.answer(f"✅ Share button added: {escape(text)}")
+
+        elif action == "add_url_button":
+            if "|" not in text:
+                return await message.answer("❌ Format: <code>text | url</code>")
+            label, url = (x.strip() for x in text.split("|", 1))
+            if not label or not url:
+                return await message.answer("❌ Both required")
+            cfg["buttons"].append({"text": label, "type": "url", "url": url})
+            await save_config(cfg)
+            await message.answer(f"✅ URL button added: {escape(label)}")
+
+        elif action == "interval":
+            sec = int(text)
+            if sec < 30:
+                return await message.answer("❌ Min 30s")
+            cfg["interval_seconds"] = sec
+            await save_config(cfg)
+            await message.answer(f"✅ Interval = {sec}s")
+
+        elif action == "share_text":
+            if not text:
+                return await message.answer("❌ Empty")
+            cfg["share_text"] = text
+            await save_config(cfg)
+            await message.answer("✅ Share text updated")
+
+        elif action == "share_chat":
+            chat_id = int(text)
+            cfg["share_chat_id"] = chat_id
+            await save_config(cfg)
+            await clear_cached_share_link()
+            await message.answer(f"✅ Share source = <code>{chat_id}</code>")
+
+    except ValueError:
+        await message.answer("❌ Invalid number. Open /admin again.")
+    except Exception as e:
+        await message.answer(f"❌ {e}")
+
+    cfg = await get_config()
+    await message.answer("🛠 <b>Admin Panel</b>", reply_markup=main_panel(cfg))
+
+# ======================================================================
+# EVENT: NEW MEMBER
 # ======================================================================
 @dp.chat_member(ChatMemberUpdatedFilter(member_status_changed=IS_NOT_MEMBER >> IS_MEMBER))
 async def on_new_member(event: ChatMemberUpdated):
@@ -513,16 +625,11 @@ async def on_new_member(event: ChatMemberUpdated):
 # ======================================================================
 app = FastAPI()
 
-def _check_secret(request: Request):
-    if WEBHOOK_SECRET and request.headers.get("X-Telegram-Bot-Api-Secret-Token", "") != WEBHOOK_SECRET:
-        # fall back to query param for /setup & /cron
-        if request.query_params.get("secret", "") != WEBHOOK_SECRET:
-            raise HTTPException(status_code=403, detail="Bad secret")
-
 
 @app.post("/api/webhook")
 async def webhook(request: Request):
-    _check_secret(request)
+    if WEBHOOK_SECRET and request.headers.get("X-Telegram-Bot-Api-Secret-Token", "") != WEBHOOK_SECRET:
+        raise HTTPException(status_code=403, detail="Bad secret")
     data = await request.json()
     bot = create_bot()
     try:
