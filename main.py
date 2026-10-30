@@ -1,4 +1,4 @@
-# app.py
+python app.py# app.py
 """
 Single-file TG Join Noti app.
 
