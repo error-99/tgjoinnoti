@@ -12,7 +12,7 @@ from typing import Optional
 from urllib.parse import quote
 
 from fastapi import FastAPI, Form, Request
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
@@ -47,6 +47,7 @@ DEFAULT_CONFIG = {
     ),
     "web_user": "admin",
     "web_pass": "admin",
+    "cron_secret": secrets.token_urlsafe(16),
 }
 
 DEFAULT_BUTTONS = {
@@ -80,8 +81,11 @@ def _read_json(path: str, default):
 
 def load_config() -> dict:
     cfg = _read_json(CONFIG_FILE, dict(DEFAULT_CONFIG))
+    # ENV OVERRIDES
+    if os.getenv("BOT_TOKEN"): cfg["bot_token"] = os.getenv("BOT_TOKEN")
     if os.getenv("WEB_USER"): cfg["web_user"] = os.getenv("WEB_USER")
     if os.getenv("WEB_PASS"): cfg["web_pass"] = os.getenv("WEB_PASS")
+    if os.getenv("CRON_SECRET"): cfg["cron_secret"] = os.getenv("CRON_SECRET")
     return cfg
 
 def save_config(cfg: dict) -> None:
@@ -108,6 +112,8 @@ def save_last_member(name_html: str) -> None:
 # ============================================================
 # BOT ENGINE
 # ============================================================
+bot_instance: Optional[Bot] = None
+bot_loop: Optional[asyncio.AbstractEventLoop] = None
 bot_task: Optional[asyncio.Task] = None
 bot_ready = threading.Event()
 bot_error: Optional[str] = None
@@ -168,7 +174,6 @@ async def replace_message_all(bot: Bot, name_html: str) -> None:
 def _is_join(event: ChatMemberUpdated) -> bool:
     return event.old_chat_member.status in ("left", "kicked") and event.new_chat_member.status == "member"
 
-# IMPORTANT: The parameter MUST be named 'bot' for aiogram to inject it
 async def new_member_handler(event: ChatMemberUpdated, bot: Bot) -> None:
     global member_name_html
     cfg = load_config()
@@ -188,9 +193,8 @@ async def refresh_loop(bot: Bot) -> None:
             interval = max(30, int(cfg.get("interval_seconds", 240)))
             await asyncio.sleep(interval)
             
-            # Only refresh if someone has joined previously
             if member_name_html:
-                log.info("Interval reached. Refreshing messages...")
+                log.info("Internal interval reached. Refreshing messages...")
                 await replace_message_all(bot, member_name_html)
                 
         except asyncio.CancelledError:
@@ -200,34 +204,33 @@ async def refresh_loop(bot: Bot) -> None:
             await asyncio.sleep(5)
 
 async def _run_bot_logic(token: str):
-    global bot_ready, bot_error, member_name_html
-    bot = Bot(token=token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    global bot_ready, bot_error, member_name_html, bot_instance
+    bot_instance = Bot(token=token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher()
     dp.chat_member.register(new_member_handler)
     
     try:
-        me = await bot.get_me()
+        me = await bot_instance.get_me()
         log.info(f"Bot @{me.username} started successfully.")
         bot_ready.set()
         bot_error = None
         
-        # Send on startup if someone already joined before
         if member_name_html:
-            await replace_message_all(bot, member_name_html)
+            await replace_message_all(bot_instance, member_name_html)
             
         await asyncio.gather(
-            dp.start_polling(bot, allowed_updates=["chat_member"]),
-            refresh_loop(bot)
+            dp.start_polling(bot_instance, allowed_updates=["chat_member"]),
+            refresh_loop(bot_instance)
         )
     except Exception as exc:
         bot_error = str(exc)
         bot_ready.clear()
         log.error(f"Bot crashed: {exc}")
     finally:
-        await bot.session.close()
+        await bot_instance.session.close()
 
 def start_bot_thread():
-    global bot_task, member_name_html
+    global bot_task, bot_loop, member_name_html
     if bot_task and not bot_task.done():
         bot_task.cancel()
     
@@ -236,10 +239,16 @@ def start_bot_thread():
     token = load_config().get("bot_token", "").strip()
     if not token: return
     
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    bot_task = loop.create_task(_run_bot_logic(token))
-    threading.Thread(target=loop.run_forever, daemon=True).start()
+    bot_loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(bot_loop)
+    bot_task = bot_loop.create_task(_run_bot_logic(token))
+    threading.Thread(target=bot_loop.run_forever, daemon=True).start()
+
+# Function to trigger via FastAPI Thread
+async def _trigger_cron():
+    if member_name_html and bot_instance:
+        log.info("Cron trigger received. Refreshing messages...")
+        await replace_message_all(bot_instance, member_name_html)
 
 # ============================================================
 # WEB UI & AUTH
@@ -286,6 +295,7 @@ CSS = """
   .toast-wrap { position:fixed; bottom:20px; right:20px; display:flex; flex-direction:column; gap:10px; z-index:100; }
   .toast { background:#0f172a; color:#fff; padding:.75rem 1rem; border-radius:8px; font-size:.9rem; box-shadow:0 10px 15px -3px rgba(0,0,0,.1); animation:slideIn .3s ease-out; }
   @keyframes slideIn { from { opacity:0; transform:translateX(20px); } to { opacity:1; transform:translateX(0); } }
+  .cron-box { background:#f1f5f9; padding:.75rem; border-radius:8px; font-family:monospace; word-break:break-all; display:flex; justify-content:space-between; align-items:center; margin-top:.5rem;}
 </style>
 """
 
@@ -298,6 +308,10 @@ JS = """
     el.textContent = msg;
     w.appendChild(el);
     setTimeout(()=>{ el.style.opacity='0'; el.style.transition='.3s'; setTimeout(()=>el.remove(), 300); }, 2500);
+  }
+  function copyCron() {
+    const txt = document.getElementById('cron-url').innerText;
+    navigator.clipboard.writeText(txt).then(() => toast('📋 Copied to clipboard!'));
   }
   const params = new URLSearchParams(location.search);
   if (params.has('saved')) toast('✅ Saved config');
@@ -351,7 +365,8 @@ async def login_page(err: Optional[str] = None):
 
 @app.post("/login")
 async def do_login(user: str = Form(...), pw: str = Form(...)):
-    if user == load_config().get("web_user") and pw == load_config().get("web_pass"):
+    cfg = load_config()
+    if user == cfg.get("web_user") and pw == cfg.get("web_pass"):
         token = secrets.token_urlsafe(24)
         SESSIONS.add(token)
         resp = RedirectResponse("/", status_code=303)
@@ -365,6 +380,16 @@ async def logout(req: Request):
     resp = RedirectResponse("/login", status_code=303)
     resp.delete_cookie(COOKIE)
     return resp
+
+@app.get("/api/cron")
+async def api_cron(secret: str = ""):
+    cfg = load_config()
+    if not secret or secret != cfg.get("cron_secret"):
+        return JSONResponse({"status": "error", "msg": "Invalid secret"}, status_code=403)
+    if bot_loop and bot_instance:
+        asyncio.run_coroutine_threadsafe(_trigger_cron(), bot_loop)
+        return {"status": "success", "msg": "Refresh triggered"}
+    return JSONResponse({"status": "error", "msg": "Bot is not running"}, status_code=400)
 
 @app.get("/", response_class=HTMLResponse)
 async def index(req: Request):
@@ -395,26 +420,37 @@ async def index(req: Request):
         </form>""" for b in load_buttons().get("buttons", [])
     )
 
+    base_url = str(req.base_url).rstrip("/")
+    cron_url = f"{base_url}/api/cron?secret={cfg.get('cron_secret')}"
+
     body = f"""
     <section>
       <h2>Bot & Chats</h2>
       <form method="post" action="/config">
-        <label>Bot Token</label>
+        <label>Bot Token (Env var `BOT_TOKEN` overrides this)</label>
         <input type="text" name="bot_token" value="{html.escape(cfg.get('bot_token',''))}" placeholder="123456:ABC...">
         
         <label>Chats (Group / Channel IDs)</label>
         {chat_rows}
         <button type="submit" formaction="/chats/add" class="ghost small" style="margin-top:.5rem;">+ Add another chat</button>
         
-        <label>Refresh Interval (Seconds)</label>
+        <label>Internal Refresh Interval (Seconds)</label>
         <input type="number" name="interval_seconds" value="{cfg.get('interval_seconds',240)}" min="30">
-        <div style="font-size:.8rem;color:var(--muted)">Reposts the message so it stays at the bottom. (Only runs after someone joins).</div>
-
+        
         <label>Message Template</label>
         <textarea name="message_template">{html.escape(cfg.get('message_template',''))}</textarea>
         
         <div class="actions"><button type="submit">Save Config & Restart Bot</button></div>
       </form>
+    </section>
+
+    <section>
+      <h2>External Cronjob</h2>
+      <p style="color:var(--muted);font-size:.9rem;">Ping this URL every 30 minutes to keep the message active.</p>
+      <div class="cron-box">
+        <span id="cron-url">{cron_url}</span>
+        <button type="button" class="ghost small" onclick="copyCron()">Copy</button>
+      </div>
     </section>
 
     <section>
@@ -437,7 +473,8 @@ async def post_config(req: Request, bot_token: str = Form(""), interval_seconds:
     cfg = load_config()
     old_token = cfg.get("bot_token", "")
     
-    cfg["bot_token"] = bot_token.strip()
+    if not os.getenv("BOT_TOKEN"):
+        cfg["bot_token"] = bot_token.strip()
     cfg["interval_seconds"] = max(30, interval_seconds)
     cfg["message_template"] = message_template
     cfg["chats"] = [{"id": cid.strip(), "type": ctype} for cid, ctype in zip(chat_id, chat_type) if cid.strip()] or [{"id": "", "type": "group"}]
