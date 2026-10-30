@@ -158,28 +158,28 @@ class AdminFlow(StatesGroup):
 async def cmd_start(message: Message):
     if message.chat.type != ChatType.PRIVATE: return
         
-    state = load_state()
+    bot_state = load_state()
     uid = message.from_user.id
     
-    if uid not in state["users"]:
-        state["users"].append(uid)
-        save_state(state)
+    if uid not in bot_state["users"]:
+        bot_state["users"].append(uid)
+        save_state(bot_state)
     
-    cfg = state["config"]
-    prev = state["dm_msg_ids"].get(str(uid))
+    cfg = bot_state["config"]
+    prev = bot_state["dm_msg_ids"].get(str(uid))
     if prev:
         try: await message.bot.delete_message(message.chat.id, prev)
         except Exception: pass
             
-    share_link = await get_share_link(message.bot, state)
+    share_link = await get_share_link(message.bot, bot_state)
     name_html = f'<a href="tg://user?id={uid}">{escape(message.from_user.full_name)}</a>'
     
     sent = await message.answer(
         cfg.get("message_template", "").replace("{name}", name_html),
         reply_markup=build_keyboard(cfg, share_link),
     )
-    state["dm_msg_ids"][str(uid)] = sent.message_id
-    save_state(state)
+    bot_state["dm_msg_ids"][str(uid)] = sent.message_id
+    save_state(bot_state)
 
 # ======================================================================
 # ENHANCED ADMIN PANEL
@@ -201,18 +201,18 @@ def main_panel(cfg: dict) -> InlineKeyboardMarkup:
     ])
 
 @dp.message(Command("admin"))
-async def cmd_admin(message: Message, state_fsm: FSMContext):
+async def cmd_admin(message: Message, state: FSMContext):
     if not await is_admin(message.from_user.id): return
-    await state_fsm.clear()
-    state = load_state()
-    await message.answer("👑 <b>Advanced Admin Dashboard</b>", reply_markup=main_panel(state["config"]))
+    await state.clear()
+    bot_state = load_state()
+    await message.answer("👑 <b>Advanced Admin Dashboard</b>", reply_markup=main_panel(bot_state["config"]))
 
 @dp.callback_query(lambda c: c.data == "menu:home")
-async def cb_home(call: CallbackQuery, state_fsm: FSMContext):
+async def cb_home(call: CallbackQuery, state: FSMContext):
     if not await is_admin(call.from_user.id): return
-    await state_fsm.clear()
-    state = load_state()
-    await call.message.edit_text("👑 <b>Advanced Admin Dashboard</b>", reply_markup=main_panel(state["config"]))
+    await state.clear()
+    bot_state = load_state()
+    await call.message.edit_text("👑 <b>Advanced Admin Dashboard</b>", reply_markup=main_panel(bot_state["config"]))
     await call.answer()
 
 @dp.callback_query(lambda c: c.data == "none")
@@ -222,9 +222,9 @@ async def cb_none(call: CallbackQuery):
 @dp.callback_query(lambda c: c.data == "action:stats")
 async def cb_stats(call: CallbackQuery):
     if not await is_admin(call.from_user.id): return
-    state = load_state()
-    total_users = len(state["users"])
-    cfg = state["config"]
+    bot_state = load_state()
+    total_users = len(bot_state["users"])
+    cfg = bot_state["config"]
     text = (
         "📊 <b>Bot Analytics</b>\n\n"
         f"👥 <b>Total Direct Users:</b> {total_users}\n"
@@ -234,14 +234,47 @@ async def cb_stats(call: CallbackQuery):
     await call.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅ Back", callback_data="menu:home")]]))
     await call.answer()
 
+@dp.callback_query(lambda c: c.data == "action:broadcast")
+async def cb_broadcast_ask(call: CallbackQuery, state: FSMContext):
+    if not await is_admin(call.from_user.id): return
+    bot_state = load_state()
+    total_users = len(bot_state["users"])
+    
+    await state.set_state(AdminFlow.waiting_broadcast)
+    await call.message.edit_text(
+        f"📡 <b>Broadcast Message</b>\n\nYou are about to send a message to <b>{total_users} users</b>.\n\nSend the message you want to broadcast now (or tap cancel):",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✖️ Cancel", callback_data="menu:home")]])
+    )
+    await call.answer()
+
+@dp.message(AdminFlow.waiting_broadcast)
+async def on_broadcast_input(message: Message, state: FSMContext):
+    if not await is_admin(message.from_user.id): return
+    await state.clear()
+    
+    bot_state = load_state()
+    users = bot_state["users"]
+    sent = 0
+    await message.answer(f"⏳ Broadcasting to {len(users)} users...")
+    
+    for uid in users:
+        try:
+            await message.bot.send_message(uid, message.html_text or message.text)
+            sent += 1
+            if sent % 25 == 0: await asyncio.sleep(1) # async sleep to prevent blocking
+        except Exception:
+            pass
+            
+    await message.answer("✅ <b>Broadcast Complete!</b>\n\n" f"Successfully delivered to {sent} users.", reply_markup=main_panel(bot_state["config"]))
+
 # ======================================================================
 # EVENT: NEW MEMBER
 # ======================================================================
 @dp.chat_member(ChatMemberUpdatedFilter(member_status_changed=IS_NOT_MEMBER >> IS_MEMBER))
 async def on_new_member(event: ChatMemberUpdated):
     if event.new_chat_member.user.is_bot: return
-    state = load_state()
-    cfg = state["config"]
+    bot_state = load_state()
+    cfg = bot_state["config"]
     if event.chat.id not in cfg["trigger_chat_ids"]: return
         
     user = event.new_chat_member.user
@@ -249,11 +282,11 @@ async def on_new_member(event: ChatMemberUpdated):
     
     cfg["last_member_name"] = name_html
     cfg["last_member_joined_at"] = int(time.time())
-    save_state(state)
+    save_state(bot_state)
     
     log.info(f"New member {user.full_name} in {event.chat.id}")
     for t in cfg.get("targets", []):
-        await refresh_target(event.bot, t["chat_id"], state, name_html)
+        await refresh_target(event.bot, t["chat_id"], bot_state, name_html)
 
 
 # ======================================================================
