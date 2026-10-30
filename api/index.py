@@ -3,6 +3,7 @@ Single-file Telegram bot — aiogram 3 + FastAPI on Vercel.
 Nice inline-button admin panel (no slash commands needed).
 
 Endpoints:
+  GET  /              ← health check (public)
   POST /api/webhook   ← Telegram updates
   GET  /api/cron      ← external cron triggers refresh
   GET  /api/setup     ← one-time webhook registration
@@ -17,6 +18,7 @@ from urllib.parse import quote
 from functools import wraps
 
 from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import HTMLResponse, JSONResponse
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
@@ -626,6 +628,69 @@ async def on_new_member(event: ChatMemberUpdated):
 app = FastAPI()
 
 
+# ----------------------------------------------------------------------
+# HEALTH CHECK (public root page)
+# ----------------------------------------------------------------------
+@app.get("/", response_class=HTMLResponse)
+async def health(request: Request):
+    try:
+        await redis.get("bot:config")   # ping Upstash
+        redis_ok = True
+    except Exception as e:
+        log.warning(f"redis health check failed: {e}")
+        redis_ok = False
+
+    payload = {
+        "status": "ok" if redis_ok else "degraded",
+        "service": "telegram-promo-bot",
+        "time": int(time.time()),
+        "checks": {
+            "redis": redis_ok,
+            "bot_token": bool(BOT_TOKEN),
+            "webhook_secret": bool(WEBHOOK_SECRET),
+            "admins_configured": bool(ADMIN_IDS),
+        },
+    }
+
+    # If a browser is asking → pretty HTML, otherwise JSON.
+    if "text/html" in request.headers.get("accept", ""):
+        color = "#0a0" if redis_ok else "#c00"
+        status_label = payload["status"].upper()
+        def tick(v: bool) -> str:
+            return "✅" if v else "❌"
+        return f"""<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Bot Health</title>
+</head>
+<body style="font-family:system-ui,-apple-system,sans-serif;padding:2rem;background:#111;color:#eee;margin:0">
+  <div style="max-width:520px;margin:auto">
+    <h1 style="margin-top:0">🤖 Bot Health</h1>
+    <p style="color:{color};font-size:1.6rem;font-weight:600;margin:.5rem 0 1.5rem">
+      ● {status_label}
+    </p>
+    <ul style="list-style:none;padding:0;line-height:1.9;font-size:1.05rem">
+      <li>{tick(redis_ok)} Redis reachable</li>
+      <li>{tick(bool(BOT_TOKEN))} BOT_TOKEN configured</li>
+      <li>{tick(bool(WEBHOOK_SECRET))} WEBHOOK_SECRET configured</li>
+      <li>{tick(bool(ADMIN_IDS))} Admin IDs configured</li>
+    </ul>
+    <p style="color:#888;font-size:.85rem;margin-top:2rem">
+      Service: {payload['service']}<br>
+      Server time: {payload['time']}
+    </p>
+  </div>
+</body>
+</html>"""
+
+    return JSONResponse(payload, status_code=200 if redis_ok else 503)
+
+
+# ----------------------------------------------------------------------
+# TELEGRAM WEBHOOK
+# ----------------------------------------------------------------------
 @app.post("/api/webhook")
 async def webhook(request: Request):
     if WEBHOOK_SECRET and request.headers.get("X-Telegram-Bot-Api-Secret-Token", "") != WEBHOOK_SECRET:
