@@ -13,11 +13,8 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.filters import Command
 from aiogram.filters.chat_member_updated import ChatMemberUpdatedFilter, IS_MEMBER, IS_NOT_MEMBER
-from aiogram.types import (
-    Message, ChatMemberUpdated, InlineKeyboardMarkup, InlineKeyboardButton
-)
+from aiogram.types import ChatMemberUpdated, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.exceptions import TelegramAPIError
 
@@ -25,10 +22,8 @@ from aiogram.exceptions import TelegramAPIError
 # CONFIGURATION
 # ======================================================================
 BOT_TOKEN    = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
-ADMIN_IDS    = [int(x) for x in os.getenv("ADMIN_IDS", "YOUR_TELEGRAM_ID_HERE").split(",") if x.strip()]
 ADMIN_SECRET = os.getenv("ADMIN_SECRET", "secret123") # Password for the web UI
 PORT         = int(os.getenv("PORT", "8000"))
-PUBLIC_URL   = os.getenv("PUBLIC_URL", "") # e.g. https://your-bot.onrender.com
 STATE_FILE   = "bot_state.json"
 
 if BOT_TOKEN == "YOUR_BOT_TOKEN_HERE" or not BOT_TOKEN:
@@ -69,11 +64,8 @@ def save_state(state: dict):
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
 
-async def is_admin(user_id: int) -> bool:
-    return user_id in ADMIN_IDS
-
 # ======================================================================
-# TELEGRAM BOT LOGIC
+# TELEGRAM BOT LOGIC (NO ADMIN COMMANDS)
 # ======================================================================
 def build_keyboard(state: dict) -> InlineKeyboardMarkup:
     rows = []
@@ -140,20 +132,6 @@ async def on_new_member(event: ChatMemberUpdated):
     name_html = f'<a href="tg://user?id={event.new_chat_member.user.id}">{escape(event.new_chat_member.user.full_name)}</a>'
     await post_to_targets(event.bot, name_html)
 
-@dp.message(Command("admin", "start"))
-async def cmd_admin(message: Message):
-    if not await is_admin(message.from_user.id): return
-    base_url = PUBLIC_URL or "http://127.0.0.1:8000"
-    admin_link = f"{base_url}/admin?secret={ADMIN_SECRET}"
-    
-    text = (
-        "⚙️ <b>Bot Web Dashboard</b>\n\n"
-        "Click the link below to open your control panel and add channels/buttons:\n\n"
-        f"<a href='{admin_link}'>🌐 Open Web Admin</a>\n\n"
-        "<i>Do not share this link with anyone!</i>"
-    )
-    await message.answer(text, disable_web_page_preview=True)
-
 # ======================================================================
 # FASTAPI WEB DASHBOARD & API
 # ======================================================================
@@ -184,7 +162,6 @@ async def api_save_state(request: Request, secret: str = ""):
     data = await request.json()
     
     state = load_state()
-    # Safely update only the configurable parts
     state["triggers"] = [int(x) for x in data.get("triggers", []) if str(x).strip()]
     state["targets"] = [int(x) for x in data.get("targets", []) if str(x).strip()]
     state["interval"] = int(data.get("interval", 300))
