@@ -5,11 +5,15 @@ Single-file TG Join Noti app.
 Run:
     python app.py
 
-Then open:
+Open:
     http://localhost:8080
 
+Default web login:
+    user: admin
+    pass: admin     (change via env WEB_USER / WEB_PASS)
+
 Files created next to this script:
-    config.json       (bot token, chats, interval, message template)
+    config.json       (bot token, chats, message template, web credentials)
     buttons.json      (custom inline buttons)
     last_member.json  (last joined member's HTML name)
 """
@@ -19,6 +23,7 @@ import html
 import json
 import logging
 import os
+import secrets
 import tempfile
 import threading
 import time
@@ -26,7 +31,7 @@ from typing import Optional
 from urllib.parse import quote
 
 from fastapi import FastAPI, Form, Request
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
@@ -51,7 +56,7 @@ log = logging.getLogger("tgjoinnoti")
 
 
 # ============================================================
-# JSON STORAGE
+# DEFAULT CONTENT
 # ============================================================
 DEFAULT_CONFIG = {
     "bot_token": "",
@@ -59,12 +64,14 @@ DEFAULT_CONFIG = {
         {"id": "", "type": "group"},
         {"id": "", "type": "channel"},
     ],
-    "interval_seconds": 240,
     "message_template": (
         "প্রিয় {name}, আপনাকে হিজাবি ভিডিওগ্রুপে জয়েন হওয়ার জন্য ধন্যবাদ। ❤️\n\n"
         "হিজাবি ভিডিওগ্রুপে ভিডিও দেখতে লিংকটি ৩টি গ্রুপে শেয়ার করুন। "
         "৩টি গ্রুপে শেয়ার করলে ভিডিওটি আনলক হবে।"
     ),
+    # web credentials (set env WEB_USER / WEB_PASS to override)
+    "web_user": "admin",
+    "web_pass": "admin",
 }
 
 DEFAULT_BUTTONS = {
@@ -76,6 +83,9 @@ DEFAULT_BUTTONS = {
 }
 
 
+# ============================================================
+# JSON STORAGE
+# ============================================================
 def _atomic_write(path: str, data) -> None:
     fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".tmp_", suffix=".json")
     with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -97,7 +107,13 @@ def _read_json(path: str, default):
 
 
 def load_config() -> dict:
-    return _read_json(CONFIG_FILE, dict(DEFAULT_CONFIG))
+    cfg = _read_json(CONFIG_FILE, dict(DEFAULT_CONFIG))
+    # env overrides for web login
+    if os.getenv("WEB_USER"):
+        cfg["web_user"] = os.getenv("WEB_USER")
+    if os.getenv("WEB_PASS"):
+        cfg["web_pass"] = os.getenv("WEB_PASS")
+    return cfg
 
 
 def save_config(cfg: dict) -> None:
@@ -117,7 +133,7 @@ def save_buttons(data: dict) -> None:
 
 def load_last_member() -> str:
     data = _read_json(STATE_FILE, {})
-    return data.get("member_name_html") or "বন্ধু"
+    return data.get("member_name_html") or ""
 
 
 def save_last_member(name_html: str) -> None:
@@ -131,11 +147,12 @@ def save_last_member(name_html: str) -> None:
 # BOT STATE
 # ============================================================
 previous_message_id: dict[int, int] = {}
-member_name_html: str = "বন্ধু"
+member_name_html: str = ""
 member_join_event: Optional[asyncio.Event] = None
 replace_lock: Optional[asyncio.Lock] = None
 bot_ready = threading.Event()
 bot_error: Optional[str] = None
+bot: Optional[Bot] = None
 
 
 # ============================================================
@@ -160,9 +177,9 @@ def make_message(template: str, name_html: str) -> str:
     return template.replace("{name}", name_html)
 
 
-async def get_share_url(bot: Bot, chat_id: int) -> str:
+async def get_share_url(bot_: Bot, chat_id: int) -> str:
     try:
-        chat = await bot.get_chat(chat_id=chat_id)
+        chat = await bot_.get_chat(chat_id=chat_id)
         target = chat.invite_link or f"https://t.me/c/{str(chat_id).replace('-100', '')}"
         text = quote("হিজাবি ভিডিওগ্রুপে জয়েন করুন")
         return f"https://t.me/share/url?url={quote(target)}&text={text}"
@@ -171,17 +188,17 @@ async def get_share_url(bot: Bot, chat_id: int) -> str:
         return "https://t.me/"
 
 
-async def replace_message_for(bot: Bot, chat_id: int, name_html: str, cfg: dict) -> None:
+async def replace_message_for(bot_: Bot, chat_id: int, name_html: str, cfg: dict) -> None:
     async with replace_lock:
         old = previous_message_id.get(chat_id)
         if old is not None:
             try:
-                await bot.delete_message(chat_id=chat_id, message_id=old)
+                await bot_.delete_message(chat_id=chat_id, message_id=old)
             except Exception as exc:
                 log.warning(f"delete old in {chat_id}: {exc}")
-        share_url = await get_share_url(bot, chat_id)
+        share_url = await get_share_url(bot_, chat_id)
         try:
-            sent = await bot.send_message(
+            sent = await bot_.send_message(
                 chat_id=chat_id,
                 text=make_message(cfg["message_template"], name_html),
                 reply_markup=make_keyboard(share_url),
@@ -193,13 +210,16 @@ async def replace_message_for(bot: Bot, chat_id: int, name_html: str, cfg: dict)
             log.error(f"send promo to {chat_id}: {exc}")
 
 
-async def replace_message_all(bot: Bot, name_html: str) -> None:
+async def replace_message_all(bot_: Bot, name_html: str) -> None:
+    if not name_html:
+        log.info("skip send: no joined member yet")
+        return
     cfg = load_config()
     chat_ids = [int(c["id"]) for c in cfg["chats"] if str(c.get("id", "")).strip()]
     if not chat_ids:
         return
     await asyncio.gather(
-        *(replace_message_for(bot, cid, name_html, cfg) for cid in chat_ids),
+        *(replace_message_for(bot_, cid, name_html, cfg) for cid in chat_ids),
         return_exceptions=True,
     )
 
@@ -209,7 +229,7 @@ def _is_join(event: ChatMemberUpdated) -> bool:
            event.new_chat_member.status == "member"
 
 
-async def new_member_handler(event: ChatMemberUpdated, bot: Bot) -> None:
+async def new_member_handler(event: ChatMemberUpdated, bot_: Bot) -> None:
     global member_name_html
     cfg = load_config()
     chat_ids = {int(c["id"]) for c in cfg["chats"] if str(c.get("id", "")).strip()}
@@ -223,29 +243,15 @@ async def new_member_handler(event: ChatMemberUpdated, bot: Bot) -> None:
     log.info(f"new member in {event.chat.id}: {user.full_name}")
     if member_join_event:
         member_join_event.set()
-    await replace_message_all(bot, member_name_html)
+    await replace_message_all(bot_, member_name_html)
 
 
-async def refresh_loop(bot: Bot) -> None:
-    while True:
-        try:
-            cfg = load_config()
-            interval = max(30, int(cfg.get("interval_seconds", 240)))
-            try:
-                await asyncio.wait_for(member_join_event.wait(), timeout=interval)
-                member_join_event.clear()
-            except asyncio.TimeoutError:
-                pass
-            await replace_message_all(bot, member_name_html)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            log.error(f"refresh_loop: {exc}")
-            await asyncio.sleep(5)
+# NOTE: no periodic re-post loop — messages are only sent when a real join happens
+# (or on startup if there's a saved last member).
 
 
 async def run_bot() -> None:
-    global member_name_html, member_join_event, replace_lock, bot_error
+    global member_name_html, member_join_event, replace_lock, bot_error, bot
 
     member_join_event = asyncio.Event()
     replace_lock = asyncio.Lock()
@@ -266,11 +272,10 @@ async def run_bot() -> None:
         me = await bot.get_me()
         log.info(f"bot @{me.username} ready")
         bot_ready.set()
-        await replace_message_all(bot, member_name_html)
-        await asyncio.gather(
-            dp.start_polling(bot, allowed_updates=["chat_member"]),
-            refresh_loop(bot),
-        )
+        # send only if we already know the last joined member
+        if member_name_html:
+            await replace_message_all(bot, member_name_html)
+        await dp.start_polling(bot, allowed_updates=["chat_member"])
     except Exception as exc:
         bot_error = str(exc)
         log.exception("bot crashed")
@@ -286,6 +291,22 @@ def bot_thread() -> None:
 
 
 # ============================================================
+# WEB AUTH (simple session cookie)
+# ============================================================
+SESSIONS: set[str] = set()
+SESSION_COOKIE = "tgn_session"
+
+
+def _creds_ok(user: str, pw: str, cfg: dict) -> bool:
+    return user == cfg.get("web_user") and pw == cfg.get("web_pass")
+
+
+def _authed(request: Request) -> bool:
+    token = request.cookies.get(SESSION_COOKIE)
+    return bool(token and token in SESSIONS)
+
+
+# ============================================================
 # WEB UI
 # ============================================================
 app = FastAPI(title="TG Join Noti")
@@ -293,48 +314,135 @@ app = FastAPI(title="TG Join Noti")
 
 PAGE = """<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
 <title>TG Join Noti — Admin</title>
 <style>
-  body{{font-family:system-ui,sans-serif;max-width:960px;margin:2rem auto;padding:0 1rem;background:#f6f7fb;color:#222}}
-  h1{{margin-bottom:.25rem}}
-  section{{background:#fff;border-radius:10px;padding:1.25rem;margin:1.25rem 0;box-shadow:0 1px 4px rgba(0,0,0,.06)}}
+  :root{{--bg:#f6f7fb;--card:#fff;--ink:#111827;--muted:#6b7280;--brand:#2563eb;--danger:#dc2626;--ok:#15803d}}
+  *{{box-sizing:border-box}}
+  body{{margin:0;background:var(--bg);color:var(--ink);font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;line-height:1.5}}
+  .wrap{{max-width:980px;margin:0 auto;padding:2rem 1rem}}
+  h1{{margin:0 0 .25rem}}
+  .muted{{color:var(--muted);font-size:.88rem}}
+  .topbar{{display:flex;justify-content:space-between;align-items:center;gap:1rem;flex-wrap:wrap}}
+  section{{background:var(--card);border-radius:14px;padding:1.25rem;margin:1.25rem 0;box-shadow:0 6px 20px rgba(17,24,39,.06);animation:rise .35s ease both}}
+  section:nth-of-type(2){{animation-delay:.06s}}
+  section:nth-of-type(3){{animation-delay:.12s}}
+  @keyframes rise{{from{{opacity:0;transform:translateY(10px)}}to{{opacity:1;transform:translateY(0)}}}}
   label{{display:block;font-weight:600;margin:.75rem 0 .25rem}}
-  input[type=text],input[type=number],textarea,select{{width:100%;padding:.55rem;border:1px solid #ccd;border-radius:6px;font:inherit;box-sizing:border-box}}
-  textarea{{min-height:120px}}
+  input[type=text],input[type=number],input[type=password],textarea,select{{width:100%;padding:.55rem .7rem;border:1px solid #d1d5db;border-radius:8px;font:inherit;background:#fff;transition:border-color .15s,box-shadow .15s}}
+  input:focus,textarea:focus,select:focus{{outline:none;border-color:var(--brand);box-shadow:0 0 0 3px rgba(37,99,235,.15)}}
+  textarea{{min-height:120px;resize:vertical}}
   .row{{display:flex;gap:.5rem;align-items:center;margin:.5rem 0}}
   .row>*{{flex:0 0 auto}}
   .row input[type=text]{{flex:1 1 auto}}
-  button{{padding:.5rem .9rem;border:0;border-radius:6px;background:#2563eb;color:#fff;cursor:pointer;font:inherit}}
-  button.danger{{background:#dc2626}}
-  button.small{{padding:.3rem .55rem;font-size:.85rem}}
-  button.ghost{{background:#e5e7eb;color:#111}}
-  .btn-card{{border:1px solid #e5e7eb;border-radius:8px;padding:.75rem;margin:.5rem 0}}
-  .muted{{color:#666;font-size:.85rem}}
-  .ok{{color:#15803d;font-weight:600}}
-  .bad{{color:#b91c1c;font-weight:600}}
+  button{{padding:.55rem 1rem;border:0;border-radius:10px;background:var(--brand);color:#fff;cursor:pointer;font:inherit;font-weight:600;transition:transform .08s,filter .15s,box-shadow .15s}}
+  button:hover{{filter:brightness(1.05)}}
+  button:active{{transform:scale(.97)}}
+  button.danger{{background:var(--danger)}}
+  button.small{{padding:.32rem .6rem;font-size:.85rem;border-radius:8px}}
+  button.ghost{{background:#eef2ff;color:#1e3a8a}}
+  .btn-card{{border:1px solid #e5e7eb;border-radius:12px;padding:.85rem;margin:.55rem 0;animation:pop .3s ease both}}
+  @keyframes pop{{from{{opacity:0;transform:scale(.97)}}to{{opacity:1;transform:scale(1)}}}}
   .actions{{display:flex;gap:.5rem;flex-wrap:wrap;margin-top:.5rem}}
-  table{{width:100%;border-collapse:collapse;background:#fff;border-radius:8px;overflow:hidden}}
+  .pill{{display:inline-block;padding:.2rem .6rem;border-radius:999px;font-size:.75rem;font-weight:700}}
+  .pill.ok{{background:#dcfce7;color:#166534}}
+  .pill.bad{{background:#fee2e2;color:#991b1b}}
+  .toast-wrap{{position:fixed;right:1rem;bottom:1rem;display:flex;flex-direction:column;gap:.5rem;z-index:50}}
+  .toast{{background:#111827;color:#fff;padding:.65rem .9rem;border-radius:10px;box-shadow:0 10px 30px rgba(0,0,0,.2);animation:slidein .25s ease}}
+  @keyframes slidein{{from{{opacity:0;transform:translateY(8px)}}to{{opacity:1;transform:translateY(0)}}}}
+  table{{width:100%;border-collapse:collapse;background:var(--card);border-radius:12px;overflow:hidden}}
   th,td{{padding:.55rem .7rem;border-bottom:1px solid #eef;text-align:left;font-size:.9rem}}
   th{{background:#f1f5f9}}
-  code{{background:#f1f5f9;padding:.1rem .3rem;border-radius:4px}}
+  code{{background:#f1f5f9;padding:.1rem .35rem;border-radius:6px}}
+  a{{color:var(--brand);text-decoration:none}}
+  a:hover{{text-decoration:underline}}
 </style></head><body>
-<h1>TG Join Noti — Admin</h1>
-<p class="muted">Status: {status}</p>
+<div class="wrap">
+<div class="topbar">
+  <div>
+    <h1>TG Join Noti — Admin</h1>
+    <div class="muted">Status: {status}</div>
+  </div>
+  <div class="actions">
+    <a href="/health"><button type="button" class="ghost">📊 Health</button></a>
+    <form method="post" action="/logout"><button type="submit" class="ghost">Logout</button></form>
+  </div>
+</div>
 {body}
+</div>
+<div class="toast-wrap" id="toasts"></div>
+<script>
+  function toast(msg, type){{
+    const w = document.getElementById('toasts');
+    const el = document.createElement('div');
+    el.className = 'toast';
+    el.textContent = msg;
+    w.appendChild(el);
+    setTimeout(()=>{{ el.style.opacity = '0'; el.style.transform='translateY(6px)'; setTimeout(()=>el.remove(), 250); }}, 2200);
+  }}
+  // show a toast when arriving via ?saved=... or ?deleted=...
+  const url = new URL(location.href);
+  if (url.searchParams.has('saved'))   toast('✅ Saved');
+  if (url.searchParams.has('deleted')) toast('🗑 Deleted');
+  if (url.searchParams.has('added'))   toast('➕ Added');
+  if (url.searchParams.has('moved'))   toast('↕ Reordered');
+</script>
 </body></html>
 """
 
 
 def _status_html() -> str:
     if bot_error:
-        return f'<span class="bad">bot error: {html.escape(bot_error)}</span>'
+        return f'<span class="pill bad">bot error: {html.escape(bot_error)}</span>'
     if bot_ready.is_set():
-        return '<span class="ok">bot running</span>'
-    return '<span class="bad">bot not started</span>'
+        return '<span class="pill ok">bot running</span>'
+    return '<span class="pill bad">bot not started</span>'
+
+
+@app.get("/login", response_class=HTMLResponse)
+async def login_page(request: Request, err: Optional[str] = None):
+    if _authed(request):
+        return RedirectResponse("/", status_code=303)
+    body = f"""<section style="max-width:420px;margin:6rem auto">
+      <h2 style="margin-top:0">Login</h2>
+      {'<p style="color:#b91c1c;font-weight:600">Wrong user or password</p>' if err else ''}
+      <form method="post" action="/login">
+        <label>Username</label>
+        <input type="text" name="user" required autofocus>
+        <label>Password</label>
+        <input type="password" name="pw" required>
+        <div class="actions"><button type="submit">Sign in</button></div>
+      </form>
+    </section>"""
+    return PAGE.format(status=_status_html(), body=body)
+
+
+@app.post("/login")
+async def do_login(user: str = Form(...), pw: str = Form(...)):
+    cfg = load_config()
+    if not _creds_ok(user, pw, cfg):
+        return RedirectResponse("/login?err=1", status_code=303)
+    token = secrets.token_urlsafe(24)
+    SESSIONS.add(token)
+    resp = RedirectResponse("/", status_code=303)
+    resp.set_cookie(SESSION_COOKIE, token, httponly=True, samesite="lax")
+    return resp
+
+
+@app.post("/logout")
+async def logout(request: Request):
+    token = request.cookies.get(SESSION_COOKIE)
+    SESSIONS.discard(token)
+    resp = RedirectResponse("/login", status_code=303)
+    resp.delete_cookie(SESSION_COOKIE)
+    return resp
 
 
 @app.get("/", response_class=HTMLResponse)
-async def index():
+async def index(request: Request):
+    if not _authed(request):
+        return RedirectResponse("/login", status_code=303)
+
     cfg = load_config()
     btns = load_buttons().get("buttons", [])
 
@@ -371,14 +479,12 @@ async def index():
 
     body = f"""
 <section>
-  <h2>Bot &amp; Chats</h2>
+  <h2 style="margin-top:0">Bot &amp; Chats</h2>
   <form method="post" action="/config">
     <label>Bot token</label>
     <input type="text" name="bot_token" value="{html.escape(cfg.get('bot_token',''))}" placeholder="123456:ABC-DEF...">
     <label>Chats (group / channel)</label>
     {chat_rows}
-    <label>Refresh interval (seconds)</label>
-    <input type="number" name="interval_seconds" min="30" value="{cfg.get('interval_seconds',240)}">
     <label>Message template (use <code>{{name}}</code>)</label>
     <textarea name="message_template">{html.escape(cfg.get('message_template',''))}</textarea>
     <div class="actions"><button type="submit">Save config</button></div>
@@ -386,17 +492,14 @@ async def index():
   <form method="post" action="/chats/add" style="margin-top:.5rem">
     <button type="submit" class="ghost small">+ Add chat slot</button>
   </form>
-  <div class="actions">
-    <a href="/health"><button type="button" class="ghost">📊 Check health</button></a>
-  </div>
 </section>
 
 <section>
-  <h2>Buttons</h2>
+  <h2 style="margin-top:0">Buttons</h2>
   <p class="muted">Use <code>{{{{SHARE_URL}}}}</code> in a URL to substitute the live share link.</p>
   {btn_cards}
   <form method="post" action="/buttons/add" class="btn-card">
-    <h3 style="margin-top:0">Add button</h3>
+    <h3 style="margin:.2rem 0 .6rem">Add button</h3>
     <div class="row">
       <input type="text" name="text" placeholder="Button text" required>
       <input type="text" name="url" placeholder="https://... or {{{{SHARE_URL}}}}" required>
@@ -410,15 +513,16 @@ async def index():
 
 @app.post("/config")
 async def post_config(
+    request: Request,
     bot_token: str = Form(""),
-    interval_seconds: int = Form(240),
     message_template: str = Form(""),
     chat_id: list[str] = Form([]),
     chat_type: list[str] = Form([]),
 ):
+    if not _authed(request):
+        return RedirectResponse("/login", status_code=303)
     cfg = load_config()
     cfg["bot_token"] = bot_token.strip()
-    cfg["interval_seconds"] = max(30, int(interval_seconds))
     cfg["message_template"] = message_template
     cfg["chats"] = [
         {"id": cid.strip(), "type": ctype}
@@ -427,19 +531,23 @@ async def post_config(
     ] or [{"id": "", "type": "group"}]
     save_config(cfg)
     log.info("config saved")
-    return RedirectResponse("/", status_code=303)
+    return RedirectResponse("/?saved=1", status_code=303)
 
 
 @app.post("/chats/add")
-async def add_chat():
+async def add_chat(request: Request):
+    if not _authed(request):
+        return RedirectResponse("/login", status_code=303)
     cfg = load_config()
     cfg["chats"].append({"id": "", "type": "group"})
     save_config(cfg)
-    return RedirectResponse("/", status_code=303)
+    return RedirectResponse("/?added=1", status_code=303)
 
 
 @app.post("/buttons/add")
-async def add_button(text: str = Form(...), url: str = Form(...)):
+async def add_button(request: Request, text: str = Form(...), url: str = Form(...)):
+    if not _authed(request):
+        return RedirectResponse("/login", status_code=303)
     data = load_buttons()
     bid = data.get("next_id", 1)
     data["next_id"] = bid + 1
@@ -447,16 +555,19 @@ async def add_button(text: str = Form(...), url: str = Form(...)):
         {"id": bid, "text": text.strip(), "url": url.strip(), "enabled": True}
     )
     save_buttons(data)
-    return RedirectResponse("/", status_code=303)
+    return RedirectResponse("/?added=1", status_code=303)
 
 
 @app.post("/buttons/update/{bid}")
 async def update_button(
+    request: Request,
     bid: int,
     text: str = Form(...),
     url: str = Form(...),
     enabled: Optional[str] = Form(None),
 ):
+    if not _authed(request):
+        return RedirectResponse("/login", status_code=303)
     data = load_buttons()
     for b in data.get("buttons", []):
         if b["id"] == bid:
@@ -465,19 +576,23 @@ async def update_button(
             b["enabled"] = enabled == "on"
             break
     save_buttons(data)
-    return RedirectResponse("/", status_code=303)
+    return RedirectResponse("/?saved=1", status_code=303)
 
 
 @app.post("/buttons/delete/{bid}")
-async def delete_button(bid: int):
+async def delete_button(request: Request, bid: int):
+    if not _authed(request):
+        return RedirectResponse("/login", status_code=303)
     data = load_buttons()
     data["buttons"] = [b for b in data.get("buttons", []) if b["id"] != bid]
     save_buttons(data)
-    return RedirectResponse("/", status_code=303)
+    return RedirectResponse("/?deleted=1", status_code=303)
 
 
 @app.post("/buttons/move/{bid}/{direction}")
-async def move_button(bid: int, direction: str):
+async def move_button(request: Request, bid: int, direction: str):
+    if not _authed(request):
+        return RedirectResponse("/login", status_code=303)
     data = load_buttons()
     arr = data.get("buttons", [])
     for i, b in enumerate(arr):
@@ -487,7 +602,7 @@ async def move_button(bid: int, direction: str):
                 arr[i], arr[j] = arr[j], arr[i]
             break
     save_buttons(data)
-    return RedirectResponse("/", status_code=303)
+    return RedirectResponse("/?moved=1", status_code=303)
 
 
 async def check_chat(token: str, chat_id: str) -> dict:
@@ -523,7 +638,9 @@ async def check_chat(token: str, chat_id: str) -> dict:
 
 
 @app.get("/health", response_class=HTMLResponse)
-async def health():
+async def health(request: Request):
+    if not _authed(request):
+        return RedirectResponse("/login", status_code=303)
     cfg = load_config()
     results = await asyncio.gather(
         *(check_chat(cfg.get("bot_token", ""), c["id"]) for c in cfg.get("chats", [])),
@@ -533,9 +650,9 @@ async def health():
     for r in results:
         if not isinstance(r, dict):
             continue
-        admin_cell = '<span class="ok">yes</span>' if r["bot_is_admin"] else '<span class="bad">no</span>'
+        admin_cell = '<span class="pill ok">yes</span>' if r["bot_is_admin"] else '<span class="pill bad">no</span>'
         link_cell = f'<a href="{r["invite_link"]}" target="_blank">open</a>' if r["invite_link"] else "—"
-        status_cell = '<span class="ok">ok</span>' if r["ok"] else f'<span class="bad">{html.escape(r["error"] or "error")}</span>'
+        status_cell = '<span class="pill ok">ok</span>' if r["ok"] else f'<span class="pill bad">{html.escape(r["error"] or "error")}</span>'
         rows += f"""<tr>
           <td><code>{html.escape(r["chat_id"])}</code></td>
           <td>{html.escape(r["title"] or "—")}</td>
@@ -546,7 +663,7 @@ async def health():
           <td>{status_cell}</td>
         </tr>"""
     body = f"""<section>
-      <p><a href="/">← back to admin</a></p>
+      <p><a href="/">← back</a></p>
       <table>
         <tr><th>Chat ID</th><th>Title</th><th>Type</th><th>Members</th>
             <th>Bot admin</th><th>Invite link</th><th>Status</th></tr>
@@ -560,17 +677,13 @@ async def health():
 # ENTRYPOINT
 # ============================================================
 if __name__ == "__main__":
-    # seed config/buttons so the web UI has something to show
     if not os.path.exists(CONFIG_FILE):
         save_config(dict(DEFAULT_CONFIG))
     if not os.path.exists(BUTTONS_FILE):
         save_buttons(dict(DEFAULT_BUTTONS))
 
-    # start bot in a background thread
     t = threading.Thread(target=bot_thread, daemon=True)
     t.start()
-
-    # wait briefly so first load can show accurate status
     time.sleep(1.0)
 
     import uvicorn
