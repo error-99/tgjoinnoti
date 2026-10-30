@@ -492,10 +492,10 @@ async def index(req: Request):
         <label>Internal Refresh Interval (Seconds)</label>
         <input type="number" name="interval_seconds" value="{cfg.get('interval_seconds',240)}" min="30">
         
-        <label>Group Message Template (use <code>{name}</code>)</label>
+        <label>Group Message Template (use <code>{{name}}</code>)</label>
         <textarea name="message_template_group">{html.escape(cfg.get('message_template_group',''))}</textarea>
         
-        <label>Channel Message Template (use <code>{name}</code>)</label>
+        <label>Channel Message Template (use <code>{{name}}</code>)</label>
         <textarea name="message_template_channel">{html.escape(cfg.get('message_template_channel',''))}</textarea>
         
         <div class="actions"><button type="submit">Save Config & Restart Bot</button></div>
