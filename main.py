@@ -162,7 +162,7 @@ async def replace_message_for(bot: Bot, chat_id: int, name_html: str, cfg: dict)
         previous_message_id[chat_id] = sent.message_id
         log.info(f"sent promo to {chat_id} -> {sent.message_id}")
     except Exception as exc:
-        log.error(f"send promo to {chat_id}: {exc}")
+        log.error(f"Failed to send promo to {chat_id}: {exc}")
 
 async def replace_message_all(bot: Bot, name_html: str) -> None:
     if not name_html: return
@@ -205,11 +205,12 @@ async def refresh_loop(bot: Bot) -> None:
 
 async def _run_bot_logic(token: str):
     global bot_ready, bot_error, member_name_html, bot_instance
-    bot_instance = Bot(token=token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-    dp = Dispatcher()
-    dp.chat_member.register(new_member_handler)
-    
     try:
+        bot_instance = Bot(token=token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+        dp = Dispatcher()
+        dp.chat_member.register(new_member_handler)
+        
+        # Test token validity
         me = await bot_instance.get_me()
         log.info(f"Bot @{me.username} started successfully.")
         bot_ready.set()
@@ -223,30 +224,36 @@ async def _run_bot_logic(token: str):
             refresh_loop(bot_instance)
         )
     except Exception as exc:
-        bot_error = str(exc)
+        bot_error = f"Startup failed: {exc}"
         bot_ready.clear()
         log.error(f"Bot crashed: {exc}")
     finally:
-        await bot_instance.session.close()
+        if bot_instance:
+            await bot_instance.session.close()
 
 def start_bot_thread():
-    global bot_task, bot_loop, member_name_html
+    global bot_task, bot_loop, member_name_html, bot_error
     if bot_task and not bot_task.done():
         bot_task.cancel()
     
     bot_ready.clear()
+    bot_error = None
     member_name_html = load_last_member()
-    token = load_config().get("bot_token", "").strip()
-    if not token: return
     
+    # Check if we have a token
+    token = load_config().get("bot_token", "").strip()
+    if not token:
+        bot_error = "Bot Token is missing. Please enter it above and click Save."
+        log.error(bot_error)
+        return
+        
     bot_loop = asyncio.new_event_loop()
     asyncio.set_event_loop(bot_loop)
     bot_task = bot_loop.create_task(_run_bot_logic(token))
     threading.Thread(target=bot_loop.run_forever, daemon=True).start()
 
-# Function to trigger via FastAPI Thread
 async def _trigger_cron():
-    if member_name_html and bot_instance:
+    if member_name_html and bot_instance and bot_ready.is_set():
         log.info("Cron trigger received. Refreshing messages...")
         await replace_message_all(bot_instance, member_name_html)
 
@@ -296,6 +303,7 @@ CSS = """
   .toast { background:#0f172a; color:#fff; padding:.75rem 1rem; border-radius:8px; font-size:.9rem; box-shadow:0 10px 15px -3px rgba(0,0,0,.1); animation:slideIn .3s ease-out; }
   @keyframes slideIn { from { opacity:0; transform:translateX(20px); } to { opacity:1; transform:translateX(0); } }
   .cron-box { background:#f1f5f9; padding:.75rem; border-radius:8px; font-family:monospace; word-break:break-all; display:flex; justify-content:space-between; align-items:center; margin-top:.5rem;}
+  .env-badge { background:#e0f2fe; color:#0369a1; font-size:.75rem; padding:.1rem .4rem; border-radius:4px; margin-left:.5rem; font-weight:normal; }
 </style>
 """
 
@@ -330,7 +338,7 @@ def render_page(status: str, body: str) -> str:
   <div class="topbar">
     <div>
       <h1>TG Join Noti</h1>
-      <div style="font-size:.85rem;color:var(--muted)">Status: {status}</div>
+      <div style="font-size:.85rem;color:var(--muted);margin-top:.5rem">Status: {status}</div>
     </div>
     <div class="actions">
       <a href="/health"><button type="button" class="ghost">📊 Health</button></a>
@@ -344,9 +352,11 @@ def render_page(status: str, body: str) -> str:
 </body></html>"""
 
 def _status_html():
-    if bot_error: return f'<span class="badge bad">Error: {html.escape(bot_error)}</span>'
-    if bot_ready.is_set(): return '<span class="badge ok">Running</span>'
-    return '<span class="badge bad">Not Started (Missing Token)</span>'
+    if bot_error: 
+        return f'<span class="badge bad">Error: {html.escape(bot_error)}</span>'
+    if bot_ready.is_set(): 
+        return '<span class="badge ok">Running</span>'
+    return '<span class="badge bad">Not Started</span>'
 
 @app.get("/login", response_class=HTMLResponse)
 async def login_page(err: Optional[str] = None):
@@ -386,7 +396,7 @@ async def api_cron(secret: str = ""):
     cfg = load_config()
     if not secret or secret != cfg.get("cron_secret"):
         return JSONResponse({"status": "error", "msg": "Invalid secret"}, status_code=403)
-    if bot_loop and bot_instance:
+    if bot_loop and bot_instance and bot_ready.is_set():
         asyncio.run_coroutine_threadsafe(_trigger_cron(), bot_loop)
         return {"status": "success", "msg": "Refresh triggered"}
     return JSONResponse({"status": "error", "msg": "Bot is not running"}, status_code=400)
@@ -423,12 +433,19 @@ async def index(req: Request):
     base_url = str(req.base_url).rstrip("/")
     cron_url = f"{base_url}/api/cron?secret={cfg.get('cron_secret')}"
 
+    # Check if ENV is setting the token
+    is_env_token = bool(os.getenv("BOT_TOKEN"))
+    token_input = f'''
+        <input type="text" name="bot_token" value="{"********" if is_env_token else html.escape(cfg.get('bot_token',''))}" placeholder="123456:ABC..." {"disabled" if is_env_token else ""}>
+        {f'<div style="font-size:.8rem;color:var(--ok);margin-top:.2rem">✅ Token is being loaded from environment variable</div>' if is_env_token else ''}
+    '''
+
     body = f"""
     <section>
       <h2>Bot & Chats</h2>
       <form method="post" action="/config">
-        <label>Bot Token (Env var `BOT_TOKEN` overrides this)</label>
-        <input type="text" name="bot_token" value="{html.escape(cfg.get('bot_token',''))}" placeholder="123456:ABC...">
+        <label>Bot Token</label>
+        {token_input}
         
         <label>Chats (Group / Channel IDs)</label>
         {chat_rows}
@@ -473,14 +490,16 @@ async def post_config(req: Request, bot_token: str = Form(""), interval_seconds:
     cfg = load_config()
     old_token = cfg.get("bot_token", "")
     
+    # Only update token from UI if it's not forced by ENV
     if not os.getenv("BOT_TOKEN"):
         cfg["bot_token"] = bot_token.strip()
+        
     cfg["interval_seconds"] = max(30, interval_seconds)
     cfg["message_template"] = message_template
     cfg["chats"] = [{"id": cid.strip(), "type": ctype} for cid, ctype in zip(chat_id, chat_type) if cid.strip()] or [{"id": "", "type": "group"}]
     save_config(cfg)
     
-    if old_token != cfg["bot_token"]:
+    if old_token != cfg["bot_token"] or not bot_ready.is_set():
         start_bot_thread()
         
     return RedirectResponse("/?saved=1", status_code=303)
