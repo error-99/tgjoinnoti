@@ -43,10 +43,15 @@ DEFAULT_CONFIG = {
     "targets": [],
     "message_template": (
         "নতুন সদস্য {name} যোগদান করেছেন! ❤️\n\n"
-        "ভিডিও দেখতে নিচের লিংকে ক্লিক করুন।"
+        "ভিডিও দেখতে লিংকটি ৩টি গ্রুপে শেয়ার করুন।"
     ),
-    "buttons": [{"text": "🎥 ভিডিও দেখুন", "type": "url", "url": "https://t.me/your_channel"}],
-    "interval_seconds": 60, # Wait 60 seconds before sending again
+    "buttons": [], # Custom URL buttons
+    "interval_seconds": 60,
+    
+    # Auto-Share System settings
+    "share_source_chat_id": None, 
+    "share_button_text": "📤 শেয়ার করুন",
+    "share_prompt_text": "হিজাবি ভিডিওগ্রুপে যোগ দিন ❤️",
 }
 
 dp = Dispatcher(storage=MemoryStorage())
@@ -69,7 +74,9 @@ def load_state() -> dict:
     return {
         "config": dict(DEFAULT_CONFIG),
         "target_msg_ids": {},
-        "target_last_sent": {}
+        "target_last_sent": {},
+        "share_link": None,
+        "share_link_expires": 0
     }
 
 def save_state(state: dict) -> None:
@@ -79,13 +86,55 @@ def save_state(state: dict) -> None:
 async def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
-def build_keyboard(cfg: dict) -> InlineKeyboardMarkup | None:
+# ======================================================================
+# LINK & KEYBOARD GENERATION
+# ======================================================================
+async def get_share_link(bot: Bot, state: dict, force: bool = False) -> str:
+    now = int(time.time())
+    # Return cached link if valid
+    if not force and state.get("share_link") and state.get("share_link_expires", 0) > now:
+        return state["share_link"]
+    
+    cfg = state["config"]
+    chat_id = cfg.get("share_source_chat_id")
+    
+    if not chat_id: 
+        return "" # No share source configured
+        
+    try:
+        chat = await bot.get_chat(chat_id)
+        if chat.username: 
+            link = f"https://t.me/{chat.username}"
+        elif chat.invite_link: 
+            link = chat.invite_link
+        else:
+            # Bot MUST be admin in that channel/group to do this
+            invite = await bot.create_chat_invite_link(chat_id=chat_id, name="AutoShare")
+            link = invite.invite_link
+            
+        state["share_link"] = link
+        state["share_link_expires"] = now + 3600 # Cache for 1 hour
+        save_state(state)
+        return link
+    except Exception as e:
+        log.error(f"Failed to fetch invite link for {chat_id}: {e}")
+        return ""
+
+def build_keyboard(cfg: dict, share_link: str) -> InlineKeyboardMarkup | None:
     rows = []
+    
+    # 1. Add Fixed Auto-Share Button (if configured)
+    if share_link:
+        share_url = f"https://t.me/share/url?url={quote(share_link, safe='')}&text={quote(cfg.get('share_prompt_text',''), safe='')}"
+        rows.append([InlineKeyboardButton(text=cfg.get("share_button_text", "📤 Share"), url=share_url)])
+        
+    # 2. Add Custom URL Buttons
     for b in cfg.get("buttons", []):
         text = (b.get("text") or "").strip()
         url = (b.get("url") or "").strip()
         if text and url: 
             rows.append([InlineKeyboardButton(text=text, url=url)])
+            
     return InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
 
 async def refresh_target(bot: Bot, chat_id: int, state: dict, name_html: str = "বন্ধু", force: bool = False) -> bool:
@@ -93,22 +142,22 @@ async def refresh_target(bot: Bot, chat_id: int, state: dict, name_html: str = "
     now = int(time.time())
     last_sent = state["target_last_sent"].get(str(chat_id), 0)
     
-    # Throttle sending: only send if interval time has passed, unless forced by admin
+    # Throttle sending
     if not force and (now - last_sent) < cfg["interval_seconds"]:
         return False
 
     old_msg = state["target_msg_ids"].get(str(chat_id))
     if old_msg:
-        try: 
-            await bot.delete_message(chat_id=chat_id, message_id=old_msg)
-        except TelegramAPIError: 
-            pass
+        try: await bot.delete_message(chat_id=chat_id, message_id=old_msg)
+        except TelegramAPIError: pass
             
+    share_link = await get_share_link(bot, state)
+    
     try:
         sent = await bot.send_message(
             chat_id=chat_id,
             text=cfg.get("message_template", "").replace("{name}", name_html),
-            reply_markup=build_keyboard(cfg),
+            reply_markup=build_keyboard(cfg, share_link),
         )
         state["target_msg_ids"][str(chat_id)] = sent.message_id
         state["target_last_sent"][str(chat_id)] = now
@@ -128,13 +177,21 @@ class AdminFlow(StatesGroup):
 # ADMIN PANEL
 # ======================================================================
 def main_panel(cfg: dict) -> InlineKeyboardMarkup:
+    share_source = cfg.get("share_source_chat_id") or "Not Set"
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"📢 Target Groups/Channels ({len(cfg['targets'])})", callback_data="menu:targets")],
-        [InlineKeyboardButton(text=f"🎯 Trigger Channels ({len(cfg['trigger_chat_ids'])})", callback_data="menu:triggers")],
+        [InlineKeyboardButton(text="— 🎯 Bots Core Settings —", callback_data="none")],
+        [InlineKeyboardButton(text=f"📢 Targets ({len(cfg['targets'])})", callback_data="menu:targets"),
+         InlineKeyboardButton(text=f"🎯 Triggers ({len(cfg['trigger_chat_ids'])})", callback_data="menu:triggers")],
         [InlineKeyboardButton(text="💬 Edit Message", callback_data="menu:message"),
-         InlineKeyboardButton(text=f"🔗 Buttons ({len(cfg['buttons'])})", callback_data="menu:buttons")],
-        [InlineKeyboardButton(text=f"⏱ Cooldown Interval: {cfg['interval_seconds']}s", callback_data="ask:interval")],
-        [InlineKeyboardButton(text="👁 Preview", callback_data="action:preview"),
+         InlineKeyboardButton(text=f"⏱ Cooldown: {cfg['interval_seconds']}s", callback_data="ask:interval")],
+         
+        [InlineKeyboardButton(text="— 📤 Auto-Share Button Settings —", callback_data="none")],
+        [InlineKeyboardButton(text=f"🔗 Set Auto-Share Chat (Now: {share_source})", callback_data="ask:share_source")],
+        [InlineKeyboardButton(text="✏️ Edit Share Text", callback_data="ask:share_button_text")],
+        
+        [InlineKeyboardButton(text="— ⚙️ Other Buttons & Actions —", callback_data="none")],
+        [InlineKeyboardButton(text=f"➕ Add Custom URL Buttons ({len(cfg['buttons'])})", callback_data="menu:buttons")],
+        [InlineKeyboardButton(text="👁 Preview Message", callback_data="action:preview"),
          InlineKeyboardButton(text="🔄 Force Send Now", callback_data="action:refresh")],
     ])
 
@@ -153,6 +210,10 @@ async def cb_home(call: CallbackQuery, state: FSMContext):
     await call.message.edit_text("👑 <b>Admin Dashboard</b>", reply_markup=main_panel(bot_state["config"]))
     await call.answer()
 
+@dp.callback_query(lambda c: c.data == "none")
+async def cb_none(call: CallbackQuery):
+    await call.answer()
+
 # --- TARGETS ---
 @dp.callback_query(lambda c: c.data == "menu:targets")
 async def cb_targets(call: CallbackQuery):
@@ -167,9 +228,9 @@ async def cb_targets(call: CallbackQuery):
 async def cb_del_target(call: CallbackQuery):
     if not await is_admin(call.from_user.id): return
     chat_id = int(call.data.split(":")[1])
-    state = load_state()
-    state["config"]["targets"] = [t for t in state["config"]["targets"] if t["chat_id"] != chat_id]
-    save_state(state)
+    bot_state = load_state()
+    bot_state["config"]["targets"] = [t for t in bot_state["config"]["targets"] if t["chat_id"] != chat_id]
+    save_state(bot_state)
     await cb_targets(call)
 
 # --- TRIGGERS ---
@@ -186,13 +247,13 @@ async def cb_triggers(call: CallbackQuery):
 async def cb_del_trigger(call: CallbackQuery):
     if not await is_admin(call.from_user.id): return
     chat_id = int(call.data.split(":")[1])
-    state = load_state()
-    if chat_id in state["config"]["trigger_chat_ids"]:
-        state["config"]["trigger_chat_ids"].remove(chat_id)
-        save_state(state)
+    bot_state = load_state()
+    if chat_id in bot_state["config"]["trigger_chat_ids"]:
+        bot_state["config"]["trigger_chat_ids"].remove(chat_id)
+        save_state(bot_state)
     await cb_triggers(call)
 
-# --- BUTTONS ---
+# --- CUSTOM BUTTONS ---
 @dp.callback_query(lambda c: c.data == "menu:buttons")
 async def cb_buttons(call: CallbackQuery):
     if not await is_admin(call.from_user.id): return
@@ -206,21 +267,23 @@ async def cb_buttons(call: CallbackQuery):
 async def cb_del_button(call: CallbackQuery):
     if not await is_admin(call.from_user.id): return
     idx = int(call.data.split(":")[1])
-    state = load_state()
-    if 0 <= idx < len(state["config"]["buttons"]):
-        state["config"]["buttons"].pop(idx)
-        save_state(state)
+    bot_state = load_state()
+    if 0 <= idx < len(bot_state["config"]["buttons"]):
+        bot_state["config"]["buttons"].pop(idx)
+        save_state(bot_state)
     await cb_buttons(call)
 
 # --- ACTIONS ---
 @dp.callback_query(lambda c: c.data == "action:preview")
 async def cb_preview(call: CallbackQuery):
     if not await is_admin(call.from_user.id): return
-    cfg = load_state()["config"]
+    bot_state = load_state()
+    cfg = bot_state["config"]
+    share_link = await get_share_link(call.bot, bot_state)
     try:
         await call.message.answer(
             "<b>👁 Preview:</b>\n\n" + cfg["message_template"].replace("{name}", f'<a href="tg://user?id={call.from_user.id}">{escape(call.from_user.full_name)}</a>'),
-            reply_markup=build_keyboard(cfg)
+            reply_markup=build_keyboard(cfg, share_link)
         )
     except Exception as e:
         await call.message.answer(f"❌ Error: {e}")
@@ -229,11 +292,11 @@ async def cb_preview(call: CallbackQuery):
 @dp.callback_query(lambda c: c.data == "action:refresh")
 async def cb_refresh(call: CallbackQuery):
     if not await is_admin(call.from_user.id): return
-    state = load_state()
+    bot_state = load_state()
     count = 0
     await call.answer("Sending to targets...")
-    for t in state["config"]["targets"]:
-        success = await refresh_target(call.bot, t["chat_id"], state, name_html="নতুন বন্ধু", force=True)
+    for t in bot_state["config"]["targets"]:
+        success = await refresh_target(call.bot, t["chat_id"], bot_state, name_html="নতুন বন্ধু", force=True)
         if success: count += 1
     await call.message.answer(f"✅ Forced refresh sent to {count} targets.")
 
@@ -244,6 +307,8 @@ ASK_PROMPTS = {
     "edit_message": ("💬 Send the new message.\nUse <code>{name}</code> for the member's mention.", "edit_message"),
     "add_button": ("🔗 Send button text and link separated by a pipe `|`\nExample: `Watch Video | https://t.me/mychannel`", "add_button"),
     "interval": ("⏱ Send the cooldown interval in seconds (e.g., 60 for 1 minute)", "interval"),
+    "share_source": ("🔗 Send the Chat ID for the Auto-Share link (e.g. -1001234567890).\n\n<i>Note: The bot MUST be an admin in this chat to generate invite links!</i>", "share_source"),
+    "share_button_text": ("✏️ Send the text for the Auto-Share Button (e.g., '📤 শেয়ার করুন')", "share_button_text"),
 }
 
 @dp.callback_query(lambda c: c.data.startswith("ask:"))
@@ -292,6 +357,19 @@ async def on_admin_input(message: Message, state: FSMContext):
             cfg["interval_seconds"] = int(text)
             await message.answer(f"✅ Cooldown interval set to {text} seconds")
             
+        elif action == "share_source":
+            cid = int(text)
+            # Test if bot can read the chat
+            await message.bot.get_chat(cid)
+            cfg["share_source_chat_id"] = cid
+            bot_state["share_link"] = None # Clear cached link
+            bot_state["share_link_expires"] = 0
+            await message.answer(f"✅ Auto-Share source updated to {cid}")
+            
+        elif action == "share_button_text":
+            cfg["share_button_text"] = text
+            await message.answer(f"✅ Share button text updated to: {text}")
+            
         save_state(bot_state)
     except Exception as e:
         await message.answer(f"❌ Error saving input: {e}")
@@ -305,8 +383,8 @@ async def on_admin_input(message: Message, state: FSMContext):
 async def on_new_member(event: ChatMemberUpdated):
     if event.new_chat_member.user.is_bot: return
     
-    state = load_state()
-    cfg = state["config"]
+    bot_state = load_state()
+    cfg = bot_state["config"]
     
     # Only act if it happens in a channel/group we are monitoring
     if event.chat.id not in cfg["trigger_chat_ids"]: return
@@ -318,7 +396,8 @@ async def on_new_member(event: ChatMemberUpdated):
     
     # Attempt to post to all targets (respecting the cooldown interval)
     for t in cfg.get("targets", []):
-        await refresh_target(event.bot, t["chat_id"], state, name_html, force=False)
+        await refresh_target(event.bot, t["chat_id"], bot_state, name_html, force=False)
+
 
 # ======================================================================
 # FASTAPI LIFESPAN & WEB SERVER (FOR RENDER HEALTH CHECKS)
