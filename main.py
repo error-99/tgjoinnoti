@@ -40,9 +40,14 @@ DEFAULT_CONFIG = {
         {"id": "", "type": "channel"},
     ],
     "interval_seconds": 240,
-    "message_template": (
+    "message_template_group": (
         "প্রিয় {name}, আপনাকে হিজাবি ভিডিওগ্রুপে জয়েন হওয়ার জন্য ধন্যবাদ। ❤️\n\n"
         "হিজাবি ভিডিওগ্রুপে ভিডিও দেখতে লিংকটি ৩টি গ্রুপে শেয়ার করুন। "
+        "৩টি গ্রুপে শেয়ার করলে ভিডিওটি আনলক হবে।"
+    ),
+    "message_template_channel": (
+        "প্রিয় {name}, আপনাকে হিজাবি ভিডিও চ্যানেলে জয়েন হওয়ার জন্য ধন্যবাদ। ❤️\n\n"
+        "হিজাবি ভিডিও চ্যানেলে ভিডিও দেখতে লিংকটি ৩টি গ্রুপে শেয়ার করুন। "
         "৩টি গ্রুপে শেয়ার করলে ভিডিওটি আনলক হবে।"
     ),
     "web_user": "admin",
@@ -81,7 +86,11 @@ def _read_json(path: str, default):
 
 def load_config() -> dict:
     cfg = _read_json(CONFIG_FILE, dict(DEFAULT_CONFIG))
-    # ENV OVERRIDES
+    # Backward compatibility if upgrading from older config
+    if "message_template" in cfg and "message_template_group" not in cfg:
+        cfg["message_template_group"] = cfg["message_template"]
+        cfg["message_template_channel"] = cfg["message_template"]
+        
     if os.getenv("BOT_TOKEN"): cfg["bot_token"] = os.getenv("BOT_TOKEN")
     if os.getenv("WEB_USER"): cfg["web_user"] = os.getenv("WEB_USER")
     if os.getenv("WEB_PASS"): cfg["web_pass"] = os.getenv("WEB_PASS")
@@ -100,12 +109,19 @@ def load_buttons() -> dict:
 def save_buttons(data: dict) -> None:
     _atomic_write(BUTTONS_FILE, data)
 
-def load_last_member() -> str:
-    return _read_json(STATE_FILE, {}).get("member_name_html") or ""
+def load_state() -> dict:
+    data = _read_json(STATE_FILE, {})
+    # Backward compatibility
+    if "member_name_html" in data and "group" not in data:
+        return {"group": data["member_name_html"], "channel": ""}
+    return {
+        "group": data.get("group", ""),
+        "channel": data.get("channel", "")
+    }
 
-def save_last_member(name_html: str) -> None:
+def save_state(state: dict) -> None:
     try:
-        _atomic_write(STATE_FILE, {"member_name_html": name_html})
+        _atomic_write(STATE_FILE, state)
     except Exception as e:
         log.warning(f"save state: {e}")
 
@@ -117,7 +133,6 @@ bot_loop: Optional[asyncio.AbstractEventLoop] = None
 bot_task: Optional[asyncio.Task] = None
 bot_ready = threading.Event()
 bot_error: Optional[str] = None
-member_name_html: str = ""
 previous_message_id: dict[int, int] = {}
 
 def make_keyboard(share_url: str) -> InlineKeyboardMarkup:
@@ -144,7 +159,7 @@ async def get_share_url(bot: Bot, chat_id: int) -> str:
     except Exception:
         return "https://t.me/"
 
-async def replace_message_for(bot: Bot, chat_id: int, name_html: str, cfg: dict) -> None:
+async def replace_message_for(bot: Bot, chat_id: int, name_html: str, template: str) -> None:
     old = previous_message_id.get(chat_id)
     if old is not None:
         try: 
@@ -155,7 +170,7 @@ async def replace_message_for(bot: Bot, chat_id: int, name_html: str, cfg: dict)
     try:
         sent = await bot.send_message(
             chat_id=chat_id,
-            text=make_message(cfg["message_template"], name_html),
+            text=make_message(template, name_html),
             reply_markup=make_keyboard(share_url),
             disable_web_page_preview=True,
         )
@@ -164,27 +179,53 @@ async def replace_message_for(bot: Bot, chat_id: int, name_html: str, cfg: dict)
     except Exception as exc:
         log.error(f"Failed to send promo to {chat_id}: {exc}")
 
-async def replace_message_all(bot: Bot, name_html: str) -> None:
-    if not name_html: return
+async def refresh_all(bot: Bot):
     cfg = load_config()
-    chat_ids = [int(c["id"]) for c in cfg["chats"] if str(c.get("id", "")).strip()]
-    if chat_ids:
-        await asyncio.gather(*(replace_message_for(bot, cid, name_html, cfg) for cid in chat_ids), return_exceptions=True)
+    state = load_state()
+    tasks = []
+    
+    if state["group"]:
+        for c in cfg.get("chats", []):
+            if c["type"] == "group" and str(c.get("id", "")).strip():
+                tasks.append(replace_message_for(bot, int(c["id"]), state["group"], cfg["message_template_group"]))
+                
+    if state["channel"]:
+        for c in cfg.get("chats", []):
+            if c["type"] == "channel" and str(c.get("id", "")).strip():
+                tasks.append(replace_message_for(bot, int(c["id"]), state["channel"], cfg["message_template_channel"]))
+                
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 def _is_join(event: ChatMemberUpdated) -> bool:
     return event.old_chat_member.status in ("left", "kicked") and event.new_chat_member.status == "member"
 
-async def new_member_handler(event: ChatMemberUpdated, bot: Bot) -> None:
-    global member_name_html
+async def new_member_handler(event: ChatMemberUpdated, bot: Bot):
     cfg = load_config()
-    chat_ids = {int(c["id"]) for c in cfg["chats"] if str(c.get("id", "")).strip()}
+    chat_conf = next((c for c in cfg["chats"] if str(c.get("id")) == str(event.chat.id)), None)
     
-    if event.chat.id in chat_ids and _is_join(event):
-        user = event.new_chat_member.user
-        member_name_html = f'<a href="tg://user?id={user.id}">{html.escape(user.full_name)}</a>'
-        save_last_member(member_name_html)
-        log.info(f"New member joined: {user.full_name}")
-        await replace_message_all(bot, member_name_html)
+    if not chat_conf or not _is_join(event):
+        return
+        
+    state = load_state()
+    user = event.new_chat_member.user
+    name_html = f'<a href="tg://user?id={user.id}">{html.escape(user.full_name)}</a>'
+    
+    if chat_conf["type"] == "group":
+        state["group"] = name_html
+        save_state(state)
+        log.info(f"New group member: {user.full_name}")
+        for c in cfg["chats"]:
+            if c["type"] == "group" and str(c.get("id", "")).strip():
+                await replace_message_for(bot, int(c["id"]), name_html, cfg["message_template_group"])
+                
+    elif chat_conf["type"] == "channel":
+        state["channel"] = name_html
+        save_state(state)
+        log.info(f"New channel member: {user.full_name}")
+        for c in cfg["chats"]:
+            if c["type"] == "channel" and str(c.get("id", "")).strip():
+                await replace_message_for(bot, int(c["id"]), name_html, cfg["message_template_channel"])
 
 async def refresh_loop(bot: Bot) -> None:
     while True:
@@ -193,9 +234,10 @@ async def refresh_loop(bot: Bot) -> None:
             interval = max(30, int(cfg.get("interval_seconds", 240)))
             await asyncio.sleep(interval)
             
-            if member_name_html:
+            state = load_state()
+            if state["group"] or state["channel"]:
                 log.info("Internal interval reached. Refreshing messages...")
-                await replace_message_all(bot, member_name_html)
+                await refresh_all(bot)
                 
         except asyncio.CancelledError:
             break
@@ -204,23 +246,22 @@ async def refresh_loop(bot: Bot) -> None:
             await asyncio.sleep(5)
 
 async def _run_bot_logic(token: str):
-    global bot_ready, bot_error, member_name_html, bot_instance
+    global bot_ready, bot_error, bot_instance
     try:
         bot_instance = Bot(token=token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
         dp = Dispatcher()
         dp.chat_member.register(new_member_handler)
         
-        # Test token validity
         me = await bot_instance.get_me()
         log.info(f"Bot @{me.username} started successfully.")
         bot_ready.set()
         bot_error = None
         
-        if member_name_html:
-            await replace_message_all(bot_instance, member_name_html)
+        state = load_state()
+        if state["group"] or state["channel"]:
+            await refresh_all(bot_instance)
             
         await asyncio.gather(
-            # CRITICAL FIX: handle_signals=False so it runs safely in background thread
             dp.start_polling(bot_instance, allowed_updates=["chat_member"], handle_signals=False),
             refresh_loop(bot_instance)
         )
@@ -233,15 +274,13 @@ async def _run_bot_logic(token: str):
             await bot_instance.session.close()
 
 def start_bot_thread():
-    global bot_task, bot_loop, member_name_html, bot_error
+    global bot_task, bot_loop, bot_error
     if bot_task and not bot_task.done():
         bot_task.cancel()
     
     bot_ready.clear()
     bot_error = None
-    member_name_html = load_last_member()
     
-    # Check if we have a token
     token = load_config().get("bot_token", "").strip()
     if not token:
         bot_error = "Bot Token is missing. Please enter it above and click Save."
@@ -254,9 +293,9 @@ def start_bot_thread():
     threading.Thread(target=bot_loop.run_forever, daemon=True).start()
 
 async def _trigger_cron():
-    if member_name_html and bot_instance and bot_ready.is_set():
+    if bot_ready.is_set() and bot_instance:
         log.info("Cron trigger received. Refreshing messages...")
-        await replace_message_all(bot_instance, member_name_html)
+        await refresh_all(bot_instance)
 
 # ============================================================
 # WEB UI & AUTH
@@ -284,7 +323,7 @@ CSS = """
   label { display:block; font-weight:600; margin:1rem 0 .4rem; font-size:.9rem; }
   input[type=text], input[type=number], input[type=password], textarea, select { width:100%; padding:.65rem; border:1px solid #cbd5e1; border-radius:8px; font:inherit; transition:.2s; }
   input:focus, textarea:focus, select:focus { outline:none; border-color:var(--brand); box-shadow:0 0 0 3px rgba(37,99,235,.15); }
-  textarea { min-height:130px; resize:vertical; }
+  textarea { min-height:100px; resize:vertical; }
   .chat-row { display:flex; gap:.5rem; margin-bottom:.5rem; }
   .chat-row input { flex:1; }
   .chat-row select { width:120px; flex-shrink:0; }
@@ -453,8 +492,11 @@ async def index(req: Request):
         <label>Internal Refresh Interval (Seconds)</label>
         <input type="number" name="interval_seconds" value="{cfg.get('interval_seconds',240)}" min="30">
         
-        <label>Message Template</label>
-        <textarea name="message_template">{html.escape(cfg.get('message_template',''))}</textarea>
+        <label>Group Message Template (use <code>{name}</code>)</label>
+        <textarea name="message_template_group">{html.escape(cfg.get('message_template_group',''))}</textarea>
+        
+        <label>Channel Message Template (use <code>{name}</code>)</label>
+        <textarea name="message_template_channel">{html.escape(cfg.get('message_template_channel',''))}</textarea>
         
         <div class="actions"><button type="submit">Save Config & Restart Bot</button></div>
       </form>
@@ -484,7 +526,7 @@ async def index(req: Request):
     return render_page(_status_html(), body)
 
 @app.post("/config")
-async def post_config(req: Request, bot_token: str = Form(""), interval_seconds: int = Form(240), message_template: str = Form(""), chat_id: list[str] = Form([]), chat_type: list[str] = Form([])):
+async def post_config(req: Request, bot_token: str = Form(""), interval_seconds: int = Form(240), message_template_group: str = Form(""), message_template_channel: str = Form(""), chat_id: list[str] = Form([]), chat_type: list[str] = Form([])):
     if not _authed(req): return RedirectResponse("/login", status_code=303)
     cfg = load_config()
     old_token = cfg.get("bot_token", "")
@@ -493,7 +535,8 @@ async def post_config(req: Request, bot_token: str = Form(""), interval_seconds:
         cfg["bot_token"] = bot_token.strip()
         
     cfg["interval_seconds"] = max(30, interval_seconds)
-    cfg["message_template"] = message_template
+    cfg["message_template_group"] = message_template_group
+    cfg["message_template_channel"] = message_template_channel
     cfg["chats"] = [{"id": cid.strip(), "type": ctype} for cid, ctype in zip(chat_id, chat_type) if cid.strip()] or [{"id": "", "type": "group"}]
     save_config(cfg)
     
