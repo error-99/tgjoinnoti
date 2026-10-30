@@ -220,7 +220,8 @@ async def _run_bot_logic(token: str):
             await replace_message_all(bot_instance, member_name_html)
             
         await asyncio.gather(
-            dp.start_polling(bot_instance, allowed_updates=["chat_member"]),
+            # CRITICAL FIX: handle_signals=False so it runs safely in background thread
+            dp.start_polling(bot_instance, allowed_updates=["chat_member"], handle_signals=False),
             refresh_loop(bot_instance)
         )
     except Exception as exc:
@@ -303,7 +304,6 @@ CSS = """
   .toast { background:#0f172a; color:#fff; padding:.75rem 1rem; border-radius:8px; font-size:.9rem; box-shadow:0 10px 15px -3px rgba(0,0,0,.1); animation:slideIn .3s ease-out; }
   @keyframes slideIn { from { opacity:0; transform:translateX(20px); } to { opacity:1; transform:translateX(0); } }
   .cron-box { background:#f1f5f9; padding:.75rem; border-radius:8px; font-family:monospace; word-break:break-all; display:flex; justify-content:space-between; align-items:center; margin-top:.5rem;}
-  .env-badge { background:#e0f2fe; color:#0369a1; font-size:.75rem; padding:.1rem .4rem; border-radius:4px; margin-left:.5rem; font-weight:normal; }
 </style>
 """
 
@@ -433,7 +433,6 @@ async def index(req: Request):
     base_url = str(req.base_url).rstrip("/")
     cron_url = f"{base_url}/api/cron?secret={cfg.get('cron_secret')}"
 
-    # Check if ENV is setting the token
     is_env_token = bool(os.getenv("BOT_TOKEN"))
     token_input = f'''
         <input type="text" name="bot_token" value="{"********" if is_env_token else html.escape(cfg.get('bot_token',''))}" placeholder="123456:ABC..." {"disabled" if is_env_token else ""}>
@@ -490,7 +489,6 @@ async def post_config(req: Request, bot_token: str = Form(""), interval_seconds:
     cfg = load_config()
     old_token = cfg.get("bot_token", "")
     
-    # Only update token from UI if it's not forced by ENV
     if not os.getenv("BOT_TOKEN"):
         cfg["bot_token"] = bot_token.strip()
         
