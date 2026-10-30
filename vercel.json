@@ -1,9 +1,0 @@
-{
-  "rewrites": [
-    { "source": "/", "destination": "/api/index" },
-    { "source": "/api/webhook", "destination": "/api/index" },
-    { "source": "/api/cron", "destination": "/api/index" },
-    { "source": "/api/setup", "destination": "/api/index" },
-    { "source": "/(.*)", "destination": "/api/index" }
-  ]
-}
