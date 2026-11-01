@@ -632,9 +632,16 @@ async def health(req: Request):
 # ============================================================
 # STARTUP
 # ============================================================
+# ============================================================
+# STARTUP
+# ============================================================
 if __name__ == "__main__":
     if not os.path.exists(CONFIG_FILE): save_config(dict(DEFAULT_CONFIG))
     if not os.path.exists(BUTTONS_FILE): save_buttons(dict(DEFAULT_BUTTONS))
 
     import uvicorn
-    uvicorn.run("app:app", host="0.0.0.0", port=8080, log_level="info")
+    # 1. Grab Render's dynamic port, fallback to 8080 for local testing
+    port = int(os.environ.get("PORT", 8080))
+    
+    # 2. Tell Uvicorn to look inside 'main.py' for the 'app' variable
+    uvicorn.run("main:app", host="0.0.0.0", port=port, log_level="info")
