@@ -6,8 +6,8 @@ import logging
 import os
 import secrets
 import tempfile
-import threading
 import time
+from contextlib import asynccontextmanager
 from typing import Optional
 from urllib.parse import quote
 
@@ -39,7 +39,7 @@ DEFAULT_CONFIG = {
         {"id": "", "type": "group"},
         {"id": "", "type": "channel"},
     ],
-    "interval_seconds": 240,
+    "interval_minutes": 4,  # Now explicitly in minutes
     "message_template_group": (
         "প্রিয় {name}, আপনাকে হিজাবি ভিডিওগ্রুপে জয়েন হওয়ার জন্য ধন্যবাদ। ❤️\n\n"
         "হিজাবি ভিডিওগ্রুপে ভিডিও দেখতে লিংকটি ৩টি গ্রুপে শেয়ার করুন। "
@@ -86,10 +86,16 @@ def _read_json(path: str, default):
 
 def load_config() -> dict:
     cfg = _read_json(CONFIG_FILE, dict(DEFAULT_CONFIG))
-    # Backward compatibility if upgrading from older config
+    
+    # Migrations for older configs
     if "message_template" in cfg and "message_template_group" not in cfg:
         cfg["message_template_group"] = cfg["message_template"]
         cfg["message_template_channel"] = cfg["message_template"]
+    
+    # Migrate seconds to minutes if old config exists
+    if "interval_seconds" in cfg:
+        cfg["interval_minutes"] = max(1, cfg["interval_seconds"] // 60)
+        del cfg["interval_seconds"]
         
     if os.getenv("BOT_TOKEN"): cfg["bot_token"] = os.getenv("BOT_TOKEN")
     if os.getenv("WEB_USER"): cfg["web_user"] = os.getenv("WEB_USER")
@@ -111,7 +117,6 @@ def save_buttons(data: dict) -> None:
 
 def load_state() -> dict:
     data = _read_json(STATE_FILE, {})
-    # Backward compatibility
     if "member_name_html" in data and "group" not in data:
         return {"group": data["member_name_html"], "channel": ""}
     return {
@@ -129,9 +134,8 @@ def save_state(state: dict) -> None:
 # BOT ENGINE
 # ============================================================
 bot_instance: Optional[Bot] = None
-bot_loop: Optional[asyncio.AbstractEventLoop] = None
 bot_task: Optional[asyncio.Task] = None
-bot_ready = threading.Event()
+bot_ready = asyncio.Event()
 bot_error: Optional[str] = None
 previous_message_id: dict[int, int] = {}
 
@@ -231,18 +235,20 @@ async def refresh_loop(bot: Bot) -> None:
     while True:
         try:
             cfg = load_config()
-            interval = max(30, int(cfg.get("interval_seconds", 240)))
-            await asyncio.sleep(interval)
+            # Calculate sleep time in seconds strictly based on minutes
+            minutes = max(1, int(cfg.get("interval_minutes", 4)))
+            await asyncio.sleep(minutes * 60)
             
             state = load_state()
             if state["group"] or state["channel"]:
-                log.info("Internal interval reached. Refreshing messages...")
+                log.info(f"Internal interval reached ({minutes} min). Refreshing messages...")
                 await refresh_all(bot)
                 
         except asyncio.CancelledError:
+            log.info("Refresh loop cancelled.")
             break
         except Exception as exc:
-            log.error(f"refresh_loop: {exc}")
+            log.error(f"refresh_loop error: {exc}")
             await asyncio.sleep(5)
 
 async def _run_bot_logic(token: str):
@@ -265,6 +271,8 @@ async def _run_bot_logic(token: str):
             dp.start_polling(bot_instance, allowed_updates=["chat_member"], handle_signals=False),
             refresh_loop(bot_instance)
         )
+    except asyncio.CancelledError:
+        log.info("Bot logic shut down gracefully.")
     except Exception as exc:
         bot_error = f"Startup failed: {exc}"
         bot_ready.clear()
@@ -273,11 +281,17 @@ async def _run_bot_logic(token: str):
         if bot_instance:
             await bot_instance.session.close()
 
-def start_bot_thread():
-    global bot_task, bot_loop, bot_error
+async def start_bot_async():
+    global bot_task, bot_error, bot_ready
+    
+    # Clean shutdown of existing bot task if it's running
     if bot_task and not bot_task.done():
         bot_task.cancel()
-    
+        try:
+            await bot_task
+        except asyncio.CancelledError:
+            pass
+            
     bot_ready.clear()
     bot_error = None
     
@@ -287,22 +301,26 @@ def start_bot_thread():
         log.error(bot_error)
         return
         
-    bot_loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(bot_loop)
-    bot_task = bot_loop.create_task(_run_bot_logic(token))
-    threading.Thread(target=bot_loop.run_forever, daemon=True).start()
+    # Start the bot properly attached to the main FastAPI event loop
+    bot_task = asyncio.create_task(_run_bot_logic(token))
 
-async def _trigger_cron():
-    if bot_ready.is_set() and bot_instance:
-        log.info("Cron trigger received. Refreshing messages...")
-        await refresh_all(bot_instance)
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Run on startup
+    await start_bot_async()
+    yield
+    # Run on shutdown
+    if bot_task and not bot_task.done():
+        bot_task.cancel()
+    if bot_instance:
+        await bot_instance.session.close()
 
 # ============================================================
 # WEB UI & AUTH
 # ============================================================
 SESSIONS = set()
 COOKIE = "tgn_session"
-app = FastAPI(title="TG Join Noti")
+app = FastAPI(title="TG Join Noti", lifespan=lifespan)
 
 def _authed(req: Request) -> bool:
     return req.cookies.get(COOKIE) in SESSIONS
@@ -435,8 +453,9 @@ async def api_cron(secret: str = ""):
     cfg = load_config()
     if not secret or secret != cfg.get("cron_secret"):
         return JSONResponse({"status": "error", "msg": "Invalid secret"}, status_code=403)
-    if bot_loop and bot_instance and bot_ready.is_set():
-        asyncio.run_coroutine_threadsafe(_trigger_cron(), bot_loop)
+    if bot_instance and bot_ready.is_set():
+        # Execute natively in the current event loop
+        asyncio.create_task(refresh_all(bot_instance))
         return {"status": "success", "msg": "Refresh triggered"}
     return JSONResponse({"status": "error", "msg": "Bot is not running"}, status_code=400)
 
@@ -489,8 +508,8 @@ async def index(req: Request):
         {chat_rows}
         <button type="submit" formaction="/chats/add" class="ghost small" style="margin-top:.5rem;">+ Add another chat</button>
         
-        <label>Internal Refresh Interval (Seconds)</label>
-        <input type="number" name="interval_seconds" value="{cfg.get('interval_seconds',240)}" min="30">
+        <label>Internal Refresh Interval (Minutes)</label>
+        <input type="number" name="interval_minutes" value="{cfg.get('interval_minutes', 4)}" min="1">
         
         <label>Group Message Template (use <code>{{name}}</code>)</label>
         <textarea name="message_template_group">{html.escape(cfg.get('message_template_group',''))}</textarea>
@@ -526,7 +545,7 @@ async def index(req: Request):
     return render_page(_status_html(), body)
 
 @app.post("/config")
-async def post_config(req: Request, bot_token: str = Form(""), interval_seconds: int = Form(240), message_template_group: str = Form(""), message_template_channel: str = Form(""), chat_id: list[str] = Form([]), chat_type: list[str] = Form([])):
+async def post_config(req: Request, bot_token: str = Form(""), interval_minutes: int = Form(4), message_template_group: str = Form(""), message_template_channel: str = Form(""), chat_id: list[str] = Form([]), chat_type: list[str] = Form([])):
     if not _authed(req): return RedirectResponse("/login", status_code=303)
     cfg = load_config()
     old_token = cfg.get("bot_token", "")
@@ -534,14 +553,15 @@ async def post_config(req: Request, bot_token: str = Form(""), interval_seconds:
     if not os.getenv("BOT_TOKEN"):
         cfg["bot_token"] = bot_token.strip()
         
-    cfg["interval_seconds"] = max(30, interval_seconds)
+    cfg["interval_minutes"] = max(1, interval_minutes)
     cfg["message_template_group"] = message_template_group
     cfg["message_template_channel"] = message_template_channel
     cfg["chats"] = [{"id": cid.strip(), "type": ctype} for cid, ctype in zip(chat_id, chat_type) if cid.strip()] or [{"id": "", "type": "group"}]
     save_config(cfg)
     
+    # Safely restart bot logic without creating new unmanaged threads
     if old_token != cfg["bot_token"] or not bot_ready.is_set():
-        start_bot_thread()
+        asyncio.create_task(start_bot_async())
         
     return RedirectResponse("/?saved=1", status_code=303)
 
@@ -616,8 +636,5 @@ if __name__ == "__main__":
     if not os.path.exists(CONFIG_FILE): save_config(dict(DEFAULT_CONFIG))
     if not os.path.exists(BUTTONS_FILE): save_buttons(dict(DEFAULT_BUTTONS))
 
-    start_bot_thread()
-    time.sleep(1)
-
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8080, log_level="info")
+    uvicorn.run("app:app", host="0.0.0.0", port=8080, log_level="info")
