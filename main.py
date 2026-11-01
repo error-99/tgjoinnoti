@@ -1,4 +1,4 @@
-# app.py
+# main.py
 import asyncio
 import html
 import json
@@ -6,7 +6,6 @@ import logging
 import os
 import secrets
 import tempfile
-import time
 from contextlib import asynccontextmanager
 from typing import Optional
 from urllib.parse import quote
@@ -39,7 +38,7 @@ DEFAULT_CONFIG = {
         {"id": "", "type": "group"},
         {"id": "", "type": "channel"},
     ],
-    "interval_minutes": 4,  # Now explicitly in minutes
+    "interval_minutes": 4,  # Strictly in minutes
     "message_template_group": (
         "প্রিয় {name}, আপনাকে হিজাবি ভিডিওগ্রুপে জয়েন হওয়ার জন্য ধন্যবাদ। ❤️\n\n"
         "হিজাবি ভিডিওগ্রুপে ভিডিও দেখতে লিংকটি ৩টি গ্রুপে শেয়ার করুন। "
@@ -87,12 +86,10 @@ def _read_json(path: str, default):
 def load_config() -> dict:
     cfg = _read_json(CONFIG_FILE, dict(DEFAULT_CONFIG))
     
-    # Migrations for older configs
     if "message_template" in cfg and "message_template_group" not in cfg:
         cfg["message_template_group"] = cfg["message_template"]
         cfg["message_template_channel"] = cfg["message_template"]
     
-    # Migrate seconds to minutes if old config exists
     if "interval_seconds" in cfg:
         cfg["interval_minutes"] = max(1, cfg["interval_seconds"] // 60)
         del cfg["interval_seconds"]
@@ -199,7 +196,10 @@ async def refresh_all(bot: Bot):
                 tasks.append(replace_message_for(bot, int(c["id"]), state["channel"], cfg["message_template_channel"]))
                 
     if tasks:
-        await asyncio.gather(*tasks, return_exceptions=True)
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for res in results:
+            if isinstance(res, Exception):
+                log.error(f"Refresh task error: {res}")
 
 def _is_join(event: ChatMemberUpdated) -> bool:
     return event.old_chat_member.status in ("left", "kicked") and event.new_chat_member.status == "member"
@@ -235,7 +235,6 @@ async def refresh_loop(bot: Bot) -> None:
     while True:
         try:
             cfg = load_config()
-            # Calculate sleep time in seconds strictly based on minutes
             minutes = max(1, int(cfg.get("interval_minutes", 4)))
             await asyncio.sleep(minutes * 60)
             
@@ -284,11 +283,11 @@ async def _run_bot_logic(token: str):
 async def start_bot_async():
     global bot_task, bot_error, bot_ready
     
-    # Clean shutdown of existing bot task if it's running
     if bot_task and not bot_task.done():
         bot_task.cancel()
         try:
-            await bot_task
+            # Short wait to allow the previous bot instance to properly release the Telegram connection
+            await asyncio.sleep(1.5)
         except asyncio.CancelledError:
             pass
             
@@ -301,7 +300,6 @@ async def start_bot_async():
         log.error(bot_error)
         return
         
-    # Start the bot properly attached to the main FastAPI event loop
     bot_task = asyncio.create_task(_run_bot_logic(token))
 
 @asynccontextmanager
@@ -454,7 +452,6 @@ async def api_cron(secret: str = ""):
     if not secret or secret != cfg.get("cron_secret"):
         return JSONResponse({"status": "error", "msg": "Invalid secret"}, status_code=403)
     if bot_instance and bot_ready.is_set():
-        # Execute natively in the current event loop
         asyncio.create_task(refresh_all(bot_instance))
         return {"status": "success", "msg": "Refresh triggered"}
     return JSONResponse({"status": "error", "msg": "Bot is not running"}, status_code=400)
@@ -559,7 +556,6 @@ async def post_config(req: Request, bot_token: str = Form(""), interval_minutes:
     cfg["chats"] = [{"id": cid.strip(), "type": ctype} for cid, ctype in zip(chat_id, chat_type) if cid.strip()] or [{"id": "", "type": "group"}]
     save_config(cfg)
     
-    # Safely restart bot logic without creating new unmanaged threads
     if old_token != cfg["bot_token"] or not bot_ready.is_set():
         asyncio.create_task(start_bot_async())
         
@@ -632,16 +628,11 @@ async def health(req: Request):
 # ============================================================
 # STARTUP
 # ============================================================
-# ============================================================
-# STARTUP
-# ============================================================
 if __name__ == "__main__":
     if not os.path.exists(CONFIG_FILE): save_config(dict(DEFAULT_CONFIG))
     if not os.path.exists(BUTTONS_FILE): save_buttons(dict(DEFAULT_BUTTONS))
 
     import uvicorn
-    # 1. Grab Render's dynamic port, fallback to 8080 for local testing
+    # Render assigns the port dynamically
     port = int(os.environ.get("PORT", 8080))
-    
-    # 2. Tell Uvicorn to look inside 'main.py' for the 'app' variable
     uvicorn.run("main:app", host="0.0.0.0", port=port, log_level="info")
