@@ -25,16 +25,13 @@ from aiogram.exceptions import TelegramAPIError
 # ======================================================================
 BOT_TOKEN    = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
 ADMIN_SECRET = os.getenv("ADMIN_SECRET", "secret123") 
-# Hardcoded your ID: 5087403859
 ADMIN_IDS    = [int(x) for x in os.getenv("ADMIN_IDS", "5087403859").split(",") if x.strip()]
 PORT         = int(os.getenv("PORT", "8000"))
-PUBLIC_URL   = os.getenv("PUBLIC_URL", "") # Add this in Render (e.g., https://tgjoinnoti-b0gj.onrender.com)
+PUBLIC_URL   = os.getenv("PUBLIC_URL", "") 
 STATE_FILE   = "bot_state.json"
 
 if BOT_TOKEN == "YOUR_BOT_TOKEN_HERE" or not BOT_TOKEN:
     raise RuntimeError("Missing BOT_TOKEN")
-if not ADMIN_IDS:
-    raise RuntimeError("Missing ADMIN_IDS")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("bot")
@@ -47,8 +44,18 @@ DEFAULT_STATE = {
     "last_sent_time": 0,
     "target_msg_ids": {}, 
     "interval": 300,
+    
+    # DM Settings
     "dm_text": "স্বাগতম! আমাদের বট ব্যবহার করার জন্য ধন্যবাদ। ❤️",
-    "dm_buttons": []      
+    "dm_buttons": [],
+    
+    # Target Group Auto-Post Settings
+    "target_msg_text": "নতুন সদস্য {name} যোগদান করেছেন! ❤️\n\nভিডিও দেখতে নিচের লিংকটি ৩টি গ্রুপে শেয়ার করুন।",
+    "share_msg": "হিজাবি ভিডিওগ্রুপে যোগ দিন ❤️",
+    "share_1_text": "📤 শেয়ার করুন ১",
+    "share_1_url": "https://t.me/your_channel",
+    "share_2_text": "📤 শেয়ার করুন ২",
+    "share_2_url": "https://t.me/your_channel_2"
 }
 
 dp = Dispatcher(storage=MemoryStorage())
@@ -81,29 +88,29 @@ async def is_admin(user_id: int) -> bool:
 # ======================================================================
 def build_keyboard(state: dict) -> InlineKeyboardMarkup:
     rows = []
-    share_text = quote("হিজাবি ভিডিওগ্রুপে যোগ দিন ❤️")
-    share_url_1 = f"https://t.me/share/url?url=https://t.me/joinchat/...&text={share_text}"
-    share_url_2 = f"https://t.me/share/url?url=https://t.me/joinchat/...&text={share_text}"
     
-    rows.append([
-        InlineKeyboardButton(text="📤 শেয়ার করুন ১", url=share_url_1),
-        InlineKeyboardButton(text="📤 শেয়ার করুন ২", url=share_url_2)
-    ])
+    if state.get("share_1_url"):
+        s_url1 = f"https://t.me/share/url?url={state['share_1_url']}&text={quote(state.get('share_msg', ''))}"
+        rows.append([InlineKeyboardButton(text=state.get("share_1_text", "Share 1"), url=s_url1)])
+        
+    if state.get("share_2_url"):
+        s_url2 = f"https://t.me/share/url?url={state['share_2_url']}&text={quote(state.get('share_msg', ''))}"
+        rows.append([InlineKeyboardButton(text=state.get("share_2_text", "Share 2"), url=s_url2)])
     
     for b in state.get("custom_buttons", []):
         rows.append([InlineKeyboardButton(text=b["text"], url=b["url"])])
         
-    return InlineKeyboardMarkup(inline_keyboard=rows)
+    return InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
 
 async def post_to_targets(bot: Bot, member_name: str):
     state = load_state()
     targets = state.get("targets", [])
     if not targets: return
         
-    msg_text = (
-        f"নতুন সদস্য {member_name} যোগদান করেছেন! ❤️\n\n"
-        "ভিডিও দেখতে নিচের লিংকটি ৩টি গ্রুপে শেয়ার করুন।"
-    )
+    # Replace the {name} placeholder with the actual HTML-formatted user name
+    raw_text = state.get("target_msg_text", DEFAULT_STATE["target_msg_text"])
+    msg_text = raw_text.replace("{name}", member_name)
+    
     keyboard = build_keyboard(state)
     
     for chat_id in targets:
@@ -134,17 +141,15 @@ async def auto_sender_task():
 
 async def auto_backup_task():
     while True:
-        await asyncio.sleep(3600) # Wait 1 hour (3600 seconds)
+        await asyncio.sleep(3600)
         state = load_state()
         backup_data = json.dumps(state, indent=2).encode('utf-8')
         doc = BufferedInputFile(backup_data, filename="bot_state.json")
-        
         for admin_id in ADMIN_IDS:
             try:
                 await bot.send_document(
-                    chat_id=admin_id, 
-                    document=doc, 
-                    caption="🕒 <b>Hourly Auto-Backup</b>\nIf Render restarts, just forward this file back to me to restore your settings!"
+                    chat_id=admin_id, document=doc, 
+                    caption="🕒 <b>Hourly Auto-Backup</b>\nForward this back to me to restore your settings!"
                 )
             except TelegramAPIError:
                 pass
@@ -155,7 +160,6 @@ async def cmd_start(message: Message):
     state = load_state()
     is_adm = await is_admin(message.from_user.id)
     
-    # 1. Send the custom DM message to the user (configured from Web UI)
     dm_text = state.get("dm_text", "স্বাগতম! ❤️")
     dm_rows = []
     for b in state.get("dm_buttons", []):
@@ -164,14 +168,12 @@ async def cmd_start(message: Message):
     
     await message.answer(dm_text, reply_markup=markup, disable_web_page_preview=True)
     
-    # 2. If the user is an ADMIN, also show them the dashboard link
     if is_adm:
         base_url = PUBLIC_URL.rstrip("/") if PUBLIC_URL else "https://tgjoinnoti-b0gj.onrender.com"
-        admin_link = f"{base_url}/admin?secret={ADMIN_SECRET}"
         text = (
             "⚙️ <b>Admin Controls</b>\n"
-            f"👉 <a href='{admin_link}'>Open Web Dashboard</a>\n\n"
-            "<i>Commands: /backup to get your config file instantly.</i>"
+            f"👉 <a href='{base_url}/admin?secret={ADMIN_SECRET}'>Open Web Dashboard</a>\n\n"
+            "<i>Commands: /backup to get config file instantly.</i>"
         )
         await message.answer(text, disable_web_page_preview=True)
 
@@ -179,12 +181,10 @@ async def cmd_start(message: Message):
 async def cmd_admin(message: Message):
     if not await is_admin(message.from_user.id): return
     base_url = PUBLIC_URL.rstrip("/") if PUBLIC_URL else "https://tgjoinnoti-b0gj.onrender.com"
-    admin_link = f"{base_url}/admin?secret={ADMIN_SECRET}"
     text = (
         "⚙️ <b>Bot Web Dashboard</b>\n\n"
-        "Click the secure link below to open your control panel:\n"
-        f"👉 <a href='{admin_link}'>Open Web Admin</a>\n\n"
-        "<i>Commands: /backup to get your config file instantly.</i>"
+        f"👉 <a href='{base_url}/admin?secret={ADMIN_SECRET}'>Open Web Admin</a>\n\n"
+        "<i>Commands: /backup to get config file instantly.</i>"
     )
     await message.answer(text, disable_web_page_preview=True)
 
@@ -194,10 +194,7 @@ async def cmd_backup(message: Message):
     state = load_state()
     backup_data = json.dumps(state, indent=2).encode('utf-8')
     doc = BufferedInputFile(backup_data, filename="bot_state.json")
-    await message.answer_document(
-        document=doc, 
-        caption="📦 <b>Instant Backup File</b>\nIf the server restarts, forward this file to me."
-    )
+    await message.answer_document(document=doc, caption="📦 <b>Instant Backup File</b>\nForward this back to restore.")
 
 # --- NEW MEMBER TRIGGER ---
 @dp.chat_member(ChatMemberUpdatedFilter(member_status_changed=IS_NOT_MEMBER >> IS_MEMBER))
@@ -205,7 +202,6 @@ async def on_new_member(event: ChatMemberUpdated):
     if event.new_chat_member.user.is_bot: return
     state = load_state()
     if event.chat.id not in state["triggers"]: return
-    
     name_html = f'<a href="tg://user?id={event.new_chat_member.user.id}">{escape(event.new_chat_member.user.full_name)}</a>'
     await post_to_targets(event.bot, name_html)
 
@@ -214,7 +210,6 @@ async def on_new_member(event: ChatMemberUpdated):
 async def restore_backup(message: Message):
     if not await is_admin(message.from_user.id): return
     if not message.document.file_name.endswith('.json'): return
-        
     try:
         file_in_memory = io.BytesIO()
         await bot.download(message.document, destination=file_in_memory)
@@ -223,9 +218,8 @@ async def restore_backup(message: Message):
         new_state = json.load(file_in_memory)
         for k, v in DEFAULT_STATE.items():
             new_state.setdefault(k, v)
-            
         save_state(new_state)
-        await message.answer("✅ <b>Backup restored successfully!</b>\nAll Triggers, Targets, and Buttons are back.")
+        await message.answer("✅ <b>Backup restored successfully!</b>")
     except Exception as e:
         await message.answer(f"❌ <b>Error restoring backup:</b>\n{e}")
 
@@ -235,13 +229,10 @@ async def restore_backup(message: Message):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await bot.delete_webhook(drop_pending_updates=True) 
-    
     polling_task = asyncio.create_task(dp.start_polling(bot))
     sender_task = asyncio.create_task(auto_sender_task())
     backup_task = asyncio.create_task(auto_backup_task())
-    
     yield 
-    
     polling_task.cancel()
     sender_task.cancel()
     backup_task.cancel()
@@ -255,10 +246,7 @@ async def root():
 
 @app.get("/health")
 async def health_check():
-    return JSONResponse(content={
-        "status": "online", 
-        "message": "Bot is running. Use /admin in Telegram to get your secure dashboard link."
-    })
+    return JSONResponse(content={"status": "online"})
 
 @app.get("/api/state")
 async def api_get_state(secret: str = ""):
@@ -269,21 +257,29 @@ async def api_get_state(secret: str = ""):
 async def api_save_state(request: Request, secret: str = ""):
     if secret != ADMIN_SECRET: raise HTTPException(403, "Unauthorized")
     data = await request.json()
-    
     state = load_state()
+    
     state["triggers"] = [int(x) for x in data.get("triggers", []) if str(x).strip()]
     state["targets"] = [int(x) for x in data.get("targets", []) if str(x).strip()]
     state["interval"] = int(data.get("interval", 300))
     state["custom_buttons"] = data.get("custom_buttons", [])
     state["dm_text"] = data.get("dm_text", DEFAULT_STATE["dm_text"])
     state["dm_buttons"] = data.get("dm_buttons", [])
+    
+    state["target_msg_text"] = data.get("target_msg_text", DEFAULT_STATE["target_msg_text"])
+    state["share_msg"] = data.get("share_msg", "")
+    state["share_1_text"] = data.get("share_1_text", "")
+    state["share_1_url"] = data.get("share_1_url", "")
+    state["share_2_text"] = data.get("share_2_text", "")
+    state["share_2_url"] = data.get("share_2_url", "")
+    
     save_state(state)
     return {"ok": True}
 
 @app.get("/admin", response_class=HTMLResponse)
 async def admin_ui(secret: str = ""):
     if secret != ADMIN_SECRET:
-        return HTMLResponse("<h1>Unauthorized. You must use the link provided by the bot in Telegram.</h1>", status_code=403)
+        return HTMLResponse("<h1>Unauthorized. Check your secret in the URL.</h1>", status_code=403)
         
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -295,11 +291,11 @@ async def admin_ui(secret: str = ""):
     <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
 </head>
 <body class="bg-gray-900 text-gray-100 p-4 md:p-8">
-    <div id="app" class="max-w-3xl mx-auto">
-        <div class="flex justify-between items-center mb-8 border-b border-gray-700 pb-4">
+    <div id="app" class="max-w-4xl mx-auto">
+        <div class="flex flex-col md:flex-row justify-between items-start md:items-center mb-8 border-b border-gray-700 pb-4 gap-4">
             <h1 class="text-3xl font-bold text-blue-400">🤖 Bot Dashboard</h1>
-            <button @click="saveConfig" class="bg-blue-600 hover:bg-blue-500 text-white px-6 py-2 rounded-lg font-semibold transition">
-                {{{{ saving ? 'Saving...' : 'Save Settings' }}}}
+            <button @click="saveConfig" class="bg-blue-600 hover:bg-blue-500 text-white px-8 py-3 rounded-lg font-bold shadow-lg transition w-full md:w-auto">
+                {{{{ saving ? 'Saving...' : 'SAVE ALL SETTINGS' }}}}
             </button>
         </div>
 
@@ -316,7 +312,7 @@ async def admin_ui(secret: str = ""):
 
             <div class="bg-gray-800 p-6 rounded-xl border border-gray-700">
                 <h2 class="text-xl font-semibold mb-2">📢 Target Groups</h2>
-                <p class="text-gray-400 text-sm mb-4">Chat IDs where bot sends links.</p>
+                <p class="text-gray-400 text-sm mb-4">Chat IDs where bot posts the links.</p>
                 <div v-for="(t, idx) in config.targets" :key="'targ'+idx" class="flex gap-2 mb-2">
                     <input v-model="config.targets[idx]" class="bg-gray-900 border border-gray-600 rounded px-3 py-2 w-full text-white" type="text" placeholder="-100123456789">
                     <button @click="config.targets.splice(idx, 1)" class="bg-red-600/80 hover:bg-red-500 px-3 rounded text-white">X</button>
@@ -325,26 +321,55 @@ async def admin_ui(secret: str = ""):
             </div>
         </div>
 
+        <!-- NEW: Editable Target Message -->
+        <div class="bg-gray-800 p-6 rounded-xl border border-gray-700 mb-8 border-l-4 border-l-green-500">
+            <h2 class="text-xl font-bold text-white mb-2">📝 Auto-Post Message</h2>
+            <p class="text-gray-400 text-sm mb-4">This is the text the bot posts to the Target Groups. Type <code>{{name}}</code> exactly like that where you want the user's name to show up.</p>
+            <textarea v-model="config.target_msg_text" rows="4" class="bg-gray-900 border border-gray-600 rounded px-3 py-2 w-full text-white"></textarea>
+        </div>
+
+        <div class="bg-gray-800 p-6 rounded-xl border border-gray-700 mb-8 border-l-4 border-l-blue-500">
+            <h2 class="text-xl font-bold text-white mb-2">📤 Main Share Buttons</h2>
+            <p class="text-gray-400 text-sm mb-6">These generate the Telegram forward link automatically. They will appear stacked on top of each other.</p>
+            
+            <div class="mb-4">
+                <label class="block text-sm text-gray-300 mb-1">Text user sees when sharing (e.g., "Join here!")</label>
+                <input v-model="config.share_msg" class="bg-gray-900 border border-gray-600 rounded px-3 py-2 w-full text-white" type="text">
+            </div>
+
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <div class="bg-gray-900/50 p-4 rounded border border-gray-700">
+                    <h3 class="font-semibold text-gray-300 mb-3">Share Button 1</h3>
+                    <label class="block text-xs text-gray-500 mb-1">Button Text</label>
+                    <input v-model="config.share_1_text" class="bg-gray-900 border border-gray-600 rounded px-3 py-2 w-full text-white mb-3" type="text">
+                    <label class="block text-xs text-gray-500 mb-1">Link to Share (e.g. https://t.me/your_channel)</label>
+                    <input v-model="config.share_1_url" class="bg-gray-900 border border-gray-600 rounded px-3 py-2 w-full text-white" type="text">
+                </div>
+
+                <div class="bg-gray-900/50 p-4 rounded border border-gray-700">
+                    <h3 class="font-semibold text-gray-300 mb-3">Share Button 2</h3>
+                    <label class="block text-xs text-gray-500 mb-1">Button Text</label>
+                    <input v-model="config.share_2_text" class="bg-gray-900 border border-gray-600 rounded px-3 py-2 w-full text-white mb-3" type="text">
+                    <label class="block text-xs text-gray-500 mb-1">Link to Share (e.g. https://t.me/your_channel)</label>
+                    <input v-model="config.share_2_url" class="bg-gray-900 border border-gray-600 rounded px-3 py-2 w-full text-white" type="text">
+                </div>
+            </div>
+        </div>
+
         <div class="bg-gray-800 p-6 rounded-xl border border-gray-700 mb-8">
-            <h2 class="text-xl font-semibold mb-2">🔗 Custom URL Buttons (Ad Message)</h2>
-            <p class="text-gray-400 text-sm mb-4">These appear below the 2 fixed share buttons in the groups.</p>
+            <h2 class="text-xl font-semibold mb-2">🔗 Custom URL Buttons</h2>
+            <p class="text-gray-400 text-sm mb-4">These appear below the 2 share buttons.</p>
             <div v-for="(btn, idx) in config.custom_buttons" :key="'btn'+idx" class="flex flex-col md:flex-row gap-2 mb-3 bg-gray-900/50 p-3 rounded border border-gray-700">
                 <input v-model="btn.text" class="bg-gray-900 border border-gray-600 rounded px-3 py-2 w-full md:w-1/3 text-white" type="text" placeholder="Button Name">
                 <input v-model="btn.url" class="bg-gray-900 border border-gray-600 rounded px-3 py-2 w-full md:w-2/3 text-white" type="text" placeholder="https://t.me/...">
                 <button @click="config.custom_buttons.splice(idx, 1)" class="bg-red-600/80 hover:bg-red-500 px-3 py-2 md:py-0 rounded text-white">Remove</button>
             </div>
-            <button @click="config.custom_buttons.push({{text: '', url: ''}})" class="text-blue-400 hover:text-blue-300 text-sm font-medium">+ Add Button</button>
+            <button @click="config.custom_buttons.push({{text: '', url: ''}})" class="text-blue-400 hover:text-blue-300 text-sm font-medium">+ Add Extra Button</button>
         </div>
 
-        <!-- NEW: Personal DM Settings -->
         <div class="bg-gray-800 p-6 rounded-xl border border-gray-700 mb-8">
-            <h2 class="text-xl font-semibold mb-2">👤 Personal Message (/start) Settings</h2>
-            <p class="text-gray-400 text-sm mb-4">This message and buttons are sent to users who message the bot directly.</p>
-            
-            <label class="block text-sm text-gray-400 mb-1">Welcome Text</label>
+            <h2 class="text-xl font-semibold mb-2">👤 Personal Message (/start)</h2>
             <textarea v-model="config.dm_text" rows="3" class="bg-gray-900 border border-gray-600 rounded px-3 py-2 w-full text-white mb-4"></textarea>
-
-            <h3 class="text-md font-semibold text-gray-300 mb-2">DM Buttons</h3>
             <div v-for="(btn, idx) in config.dm_buttons" :key="'dm_btn'+idx" class="flex flex-col md:flex-row gap-2 mb-3 bg-gray-900/50 p-3 rounded border border-gray-700">
                 <input v-model="btn.text" class="bg-gray-900 border border-gray-600 rounded px-3 py-2 w-full md:w-1/3 text-white" type="text" placeholder="Button Name">
                 <input v-model="btn.url" class="bg-gray-900 border border-gray-600 rounded px-3 py-2 w-full md:w-2/3 text-white" type="text" placeholder="https://t.me/...">
@@ -354,12 +379,12 @@ async def admin_ui(secret: str = ""):
         </div>
 
         <div class="bg-gray-800 p-6 rounded-xl border border-gray-700">
-            <h2 class="text-xl font-semibold mb-4">⚙️ Auto-Send Settings</h2>
+            <h2 class="text-xl font-semibold mb-4">⚙️ System Settings</h2>
             <label class="block text-sm text-gray-400 mb-1">Cooldown Interval (Seconds)</label>
             <input v-model="config.interval" class="bg-gray-900 border border-gray-600 rounded px-3 py-2 w-full md:w-1/3 text-white" type="number" min="30">
         </div>
         
-        <div v-if="toast" class="fixed bottom-4 right-4 bg-green-600 text-white px-6 py-3 rounded shadow-lg transition-opacity duration-300">
+        <div v-if="toast" class="fixed bottom-4 right-4 bg-green-600 text-white px-6 py-3 rounded shadow-lg transition-opacity duration-300 z-50">
             ✅ Settings Saved Successfully!
         </div>
     </div>
@@ -371,7 +396,7 @@ async def admin_ui(secret: str = ""):
         createApp({{
             data() {{
                 return {{
-                    config: {{ triggers: [], targets: [], custom_buttons: [], interval: 300, dm_text: "", dm_buttons: [] }},
+                    config: {{ triggers: [], targets: [], custom_buttons: [], interval: 300, dm_text: "", dm_buttons: [], target_msg_text: "", share_msg: "", share_1_text: "", share_1_url: "", share_2_text: "", share_2_url: "" }},
                     saving: false,
                     toast: false
                 }}
@@ -384,8 +409,15 @@ async def admin_ui(secret: str = ""):
                     this.config.targets = data.targets || [];
                     this.config.custom_buttons = data.custom_buttons || [];
                     this.config.interval = data.interval || 300;
-                    this.config.dm_text = data.dm_text || "স্বাগতম! আমাদের বট ব্যবহার করার জন্য ধন্যবাদ। ❤️";
+                    this.config.dm_text = data.dm_text || "স্বাগতম! ❤️";
                     this.config.dm_buttons = data.dm_buttons || [];
+                    
+                    this.config.target_msg_text = data.target_msg_text || "নতুন সদস্য {{name}} যোগদান করেছেন! ❤️\\n\\nভিডিও দেখতে নিচের লিংকটি ৩টি গ্রুপে শেয়ার করুন।";
+                    this.config.share_msg = data.share_msg || "";
+                    this.config.share_1_text = data.share_1_text || "";
+                    this.config.share_1_url = data.share_1_url || "";
+                    this.config.share_2_text = data.share_2_text || "";
+                    this.config.share_2_url = data.share_2_url || "";
                 }}
             }},
             methods: {{
