@@ -25,6 +25,7 @@ from aiogram.exceptions import TelegramAPIError
 # ======================================================================
 BOT_TOKEN    = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
 ADMIN_SECRET = os.getenv("ADMIN_SECRET", "secret123") 
+# Hardcoded your ID: 5087403859
 ADMIN_IDS    = [int(x) for x in os.getenv("ADMIN_IDS", "5087403859").split(",") if x.strip()]
 PORT         = int(os.getenv("PORT", "8000"))
 PUBLIC_URL   = os.getenv("PUBLIC_URL", "") # Add this in Render (e.g., https://tgjoinnoti-b0gj.onrender.com)
@@ -45,7 +46,9 @@ DEFAULT_STATE = {
     "last_member": "নতুন বন্ধু",
     "last_sent_time": 0,
     "target_msg_ids": {}, 
-    "interval": 300,      
+    "interval": 300,
+    "dm_text": "স্বাগতম! আমাদের বট ব্যবহার করার জন্য ধন্যবাদ। ❤️",
+    "dm_buttons": []      
 }
 
 dp = Dispatcher(storage=MemoryStorage())
@@ -147,20 +150,54 @@ async def auto_backup_task():
                 pass
 
 # --- TELEGRAM COMMANDS ---
-@dp.message(Command("start", "admin"))
+@dp.message(CommandStart())
+async def cmd_start(message: Message):
+    state = load_state()
+    is_adm = await is_admin(message.from_user.id)
+    
+    # 1. Send the custom DM message to the user (configured from Web UI)
+    dm_text = state.get("dm_text", "স্বাগতম! ❤️")
+    dm_rows = []
+    for b in state.get("dm_buttons", []):
+        dm_rows.append([InlineKeyboardButton(text=b["text"], url=b["url"])])
+    markup = InlineKeyboardMarkup(inline_keyboard=dm_rows) if dm_rows else None
+    
+    await message.answer(dm_text, reply_markup=markup, disable_web_page_preview=True)
+    
+    # 2. If the user is an ADMIN, also show them the dashboard link
+    if is_adm:
+        base_url = PUBLIC_URL.rstrip("/") if PUBLIC_URL else "https://tgjoinnoti-b0gj.onrender.com"
+        admin_link = f"{base_url}/admin?secret={ADMIN_SECRET}"
+        text = (
+            "⚙️ <b>Admin Controls</b>\n"
+            f"👉 <a href='{admin_link}'>Open Web Dashboard</a>\n\n"
+            "<i>Commands: /backup to get your config file instantly.</i>"
+        )
+        await message.answer(text, disable_web_page_preview=True)
+
+@dp.message(Command("admin"))
 async def cmd_admin(message: Message):
     if not await is_admin(message.from_user.id): return
-    
     base_url = PUBLIC_URL.rstrip("/") if PUBLIC_URL else "https://tgjoinnoti-b0gj.onrender.com"
     admin_link = f"{base_url}/admin?secret={ADMIN_SECRET}"
-    
     text = (
         "⚙️ <b>Bot Web Dashboard</b>\n\n"
         "Click the secure link below to open your control panel:\n"
         f"👉 <a href='{admin_link}'>Open Web Admin</a>\n\n"
-        "<i>Note: If your settings erase, just upload your hourly backup .json file here to restore everything.</i>"
+        "<i>Commands: /backup to get your config file instantly.</i>"
     )
     await message.answer(text, disable_web_page_preview=True)
+
+@dp.message(Command("backup"))
+async def cmd_backup(message: Message):
+    if not await is_admin(message.from_user.id): return
+    state = load_state()
+    backup_data = json.dumps(state, indent=2).encode('utf-8')
+    doc = BufferedInputFile(backup_data, filename="bot_state.json")
+    await message.answer_document(
+        document=doc, 
+        caption="📦 <b>Instant Backup File</b>\nIf the server restarts, forward this file to me."
+    )
 
 # --- NEW MEMBER TRIGGER ---
 @dp.chat_member(ChatMemberUpdatedFilter(member_status_changed=IS_NOT_MEMBER >> IS_MEMBER))
@@ -197,7 +234,6 @@ async def restore_backup(message: Message):
 # ======================================================================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # drop_pending_updates fixes the TelegramConflictError
     await bot.delete_webhook(drop_pending_updates=True) 
     
     polling_task = asyncio.create_task(dp.start_polling(bot))
@@ -239,6 +275,8 @@ async def api_save_state(request: Request, secret: str = ""):
     state["targets"] = [int(x) for x in data.get("targets", []) if str(x).strip()]
     state["interval"] = int(data.get("interval", 300))
     state["custom_buttons"] = data.get("custom_buttons", [])
+    state["dm_text"] = data.get("dm_text", DEFAULT_STATE["dm_text"])
+    state["dm_buttons"] = data.get("dm_buttons", [])
     save_state(state)
     return {"ok": True}
 
@@ -288,14 +326,31 @@ async def admin_ui(secret: str = ""):
         </div>
 
         <div class="bg-gray-800 p-6 rounded-xl border border-gray-700 mb-8">
-            <h2 class="text-xl font-semibold mb-2">🔗 Custom URL Buttons</h2>
-            <p class="text-gray-400 text-sm mb-4">These appear below the 2 fixed share buttons.</p>
+            <h2 class="text-xl font-semibold mb-2">🔗 Custom URL Buttons (Ad Message)</h2>
+            <p class="text-gray-400 text-sm mb-4">These appear below the 2 fixed share buttons in the groups.</p>
             <div v-for="(btn, idx) in config.custom_buttons" :key="'btn'+idx" class="flex flex-col md:flex-row gap-2 mb-3 bg-gray-900/50 p-3 rounded border border-gray-700">
                 <input v-model="btn.text" class="bg-gray-900 border border-gray-600 rounded px-3 py-2 w-full md:w-1/3 text-white" type="text" placeholder="Button Name">
                 <input v-model="btn.url" class="bg-gray-900 border border-gray-600 rounded px-3 py-2 w-full md:w-2/3 text-white" type="text" placeholder="https://t.me/...">
                 <button @click="config.custom_buttons.splice(idx, 1)" class="bg-red-600/80 hover:bg-red-500 px-3 py-2 md:py-0 rounded text-white">Remove</button>
             </div>
             <button @click="config.custom_buttons.push({{text: '', url: ''}})" class="text-blue-400 hover:text-blue-300 text-sm font-medium">+ Add Button</button>
+        </div>
+
+        <!-- NEW: Personal DM Settings -->
+        <div class="bg-gray-800 p-6 rounded-xl border border-gray-700 mb-8">
+            <h2 class="text-xl font-semibold mb-2">👤 Personal Message (/start) Settings</h2>
+            <p class="text-gray-400 text-sm mb-4">This message and buttons are sent to users who message the bot directly.</p>
+            
+            <label class="block text-sm text-gray-400 mb-1">Welcome Text</label>
+            <textarea v-model="config.dm_text" rows="3" class="bg-gray-900 border border-gray-600 rounded px-3 py-2 w-full text-white mb-4"></textarea>
+
+            <h3 class="text-md font-semibold text-gray-300 mb-2">DM Buttons</h3>
+            <div v-for="(btn, idx) in config.dm_buttons" :key="'dm_btn'+idx" class="flex flex-col md:flex-row gap-2 mb-3 bg-gray-900/50 p-3 rounded border border-gray-700">
+                <input v-model="btn.text" class="bg-gray-900 border border-gray-600 rounded px-3 py-2 w-full md:w-1/3 text-white" type="text" placeholder="Button Name">
+                <input v-model="btn.url" class="bg-gray-900 border border-gray-600 rounded px-3 py-2 w-full md:w-2/3 text-white" type="text" placeholder="https://t.me/...">
+                <button @click="config.dm_buttons.splice(idx, 1)" class="bg-red-600/80 hover:bg-red-500 px-3 py-2 md:py-0 rounded text-white">Remove</button>
+            </div>
+            <button @click="config.dm_buttons.push({{text: '', url: ''}})" class="text-blue-400 hover:text-blue-300 text-sm font-medium">+ Add DM Button</button>
         </div>
 
         <div class="bg-gray-800 p-6 rounded-xl border border-gray-700">
@@ -316,7 +371,7 @@ async def admin_ui(secret: str = ""):
         createApp({{
             data() {{
                 return {{
-                    config: {{ triggers: [], targets: [], custom_buttons: [], interval: 300 }},
+                    config: {{ triggers: [], targets: [], custom_buttons: [], interval: 300, dm_text: "", dm_buttons: [] }},
                     saving: false,
                     toast: false
                 }}
@@ -329,6 +384,8 @@ async def admin_ui(secret: str = ""):
                     this.config.targets = data.targets || [];
                     this.config.custom_buttons = data.custom_buttons || [];
                     this.config.interval = data.interval || 300;
+                    this.config.dm_text = data.dm_text || "স্বাগতম! আমাদের বট ব্যবহার করার জন্য ধন্যবাদ। ❤️";
+                    this.config.dm_buttons = data.dm_buttons || [];
                 }}
             }},
             methods: {{
