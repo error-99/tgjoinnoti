@@ -9,11 +9,12 @@ from urllib.parse import quote
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
+from aiogram.filters import Command, CommandStart
 from aiogram.filters.chat_member_updated import ChatMemberUpdatedFilter, IS_MEMBER, IS_NOT_MEMBER
 from aiogram.types import ChatMemberUpdated, InlineKeyboardMarkup, InlineKeyboardButton, BufferedInputFile, Message
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -26,12 +27,13 @@ BOT_TOKEN    = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
 ADMIN_SECRET = os.getenv("ADMIN_SECRET", "secret123") 
 ADMIN_IDS    = [int(x) for x in os.getenv("ADMIN_IDS", "5087403859").split(",") if x.strip()]
 PORT         = int(os.getenv("PORT", "8000"))
+PUBLIC_URL   = os.getenv("PUBLIC_URL", "") # Add this in Render (e.g., https://tgjoinnoti-b0gj.onrender.com)
 STATE_FILE   = "bot_state.json"
 
 if BOT_TOKEN == "YOUR_BOT_TOKEN_HERE" or not BOT_TOKEN:
     raise RuntimeError("Missing BOT_TOKEN")
 if not ADMIN_IDS:
-    raise RuntimeError("Missing ADMIN_IDS (needed to send backups)")
+    raise RuntimeError("Missing ADMIN_IDS")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("bot")
@@ -141,8 +143,24 @@ async def auto_backup_task():
                     document=doc, 
                     caption="🕒 <b>Hourly Auto-Backup</b>\nIf Render restarts, just forward this file back to me to restore your settings!"
                 )
-            except TelegramAPIError as e:
-                log.error(f"Failed to send backup to {admin_id}: {e}")
+            except TelegramAPIError:
+                pass
+
+# --- TELEGRAM COMMANDS ---
+@dp.message(Command("start", "admin"))
+async def cmd_admin(message: Message):
+    if not await is_admin(message.from_user.id): return
+    
+    base_url = PUBLIC_URL.rstrip("/") if PUBLIC_URL else "https://tgjoinnoti-b0gj.onrender.com"
+    admin_link = f"{base_url}/admin?secret={ADMIN_SECRET}"
+    
+    text = (
+        "⚙️ <b>Bot Web Dashboard</b>\n\n"
+        "Click the secure link below to open your control panel:\n"
+        f"👉 <a href='{admin_link}'>Open Web Admin</a>\n\n"
+        "<i>Note: If your settings erase, just upload your hourly backup .json file here to restore everything.</i>"
+    )
+    await message.answer(text, disable_web_page_preview=True)
 
 # --- NEW MEMBER TRIGGER ---
 @dp.chat_member(ChatMemberUpdatedFilter(member_status_changed=IS_NOT_MEMBER >> IS_MEMBER))
@@ -161,15 +179,11 @@ async def restore_backup(message: Message):
     if not message.document.file_name.endswith('.json'): return
         
     try:
-        # Download the sent file into memory
         file_in_memory = io.BytesIO()
         await bot.download(message.document, destination=file_in_memory)
         file_in_memory.seek(0)
         
-        # Parse it and overwrite local state
         new_state = json.load(file_in_memory)
-        
-        # Ensure default keys exist in case of old backup format
         for k, v in DEFAULT_STATE.items():
             new_state.setdefault(k, v)
             
@@ -183,6 +197,7 @@ async def restore_backup(message: Message):
 # ======================================================================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # drop_pending_updates fixes the TelegramConflictError
     await bot.delete_webhook(drop_pending_updates=True) 
     
     polling_task = asyncio.create_task(dp.start_polling(bot))
@@ -198,9 +213,16 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
+@app.get("/")
+async def root():
+    return RedirectResponse(url="/health")
+
 @app.get("/health")
 async def health_check():
-    return {"status": "online"}
+    return JSONResponse(content={
+        "status": "online", 
+        "message": "Bot is running. Use /admin in Telegram to get your secure dashboard link."
+    })
 
 @app.get("/api/state")
 async def api_get_state(secret: str = ""):
@@ -223,7 +245,7 @@ async def api_save_state(request: Request, secret: str = ""):
 @app.get("/admin", response_class=HTMLResponse)
 async def admin_ui(secret: str = ""):
     if secret != ADMIN_SECRET:
-        return HTMLResponse("<h1>Unauthorized. Check your secret in the URL.</h1>", status_code=403)
+        return HTMLResponse("<h1>Unauthorized. You must use the link provided by the bot in Telegram.</h1>", status_code=403)
         
     return f"""<!DOCTYPE html>
 <html lang="en">
