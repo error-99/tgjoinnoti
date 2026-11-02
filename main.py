@@ -1,638 +1,335 @@
-# main.py
-import asyncio
-import html
-import json
-import logging
 import os
-import secrets
-import tempfile
-from contextlib import asynccontextmanager
-from typing import Optional
+import io
+import json
+import time
+import asyncio
+import logging
+from html import escape
 from urllib.parse import quote
+from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Form, Request
-from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
-from aiogram import Bot, Dispatcher
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import HTMLResponse, JSONResponse
+
+from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.types import ChatMemberUpdated, InlineKeyboardButton, InlineKeyboardMarkup
-from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.filters.chat_member_updated import ChatMemberUpdatedFilter, IS_MEMBER, IS_NOT_MEMBER
+from aiogram.types import ChatMemberUpdated, InlineKeyboardMarkup, InlineKeyboardButton, BufferedInputFile, Message
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.exceptions import TelegramAPIError
 
-# ============================================================
-# PATHS / LOGGING
-# ============================================================
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
-BUTTONS_FILE = os.path.join(BASE_DIR, "buttons.json")
-STATE_FILE = os.path.join(BASE_DIR, "last_member.json")
+# ======================================================================
+# CONFIGURATION
+# ======================================================================
+BOT_TOKEN    = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
+ADMIN_SECRET = os.getenv("ADMIN_SECRET", "secret123") 
+ADMIN_IDS    = [int(x) for x in os.getenv("ADMIN_IDS", "5087403859").split(",") if x.strip()]
+PORT         = int(os.getenv("PORT", "8000"))
+STATE_FILE   = "bot_state.json"
+
+if BOT_TOKEN == "YOUR_BOT_TOKEN_HERE" or not BOT_TOKEN:
+    raise RuntimeError("Missing BOT_TOKEN")
+if not ADMIN_IDS:
+    raise RuntimeError("Missing ADMIN_IDS (needed to send backups)")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-log = logging.getLogger("tgjoinnoti")
+log = logging.getLogger("bot")
 
-# ============================================================
-# DEFAULTS
-# ============================================================
-DEFAULT_CONFIG = {
-    "bot_token": "",
-    "chats": [
-        {"id": "", "type": "group"},
-        {"id": "", "type": "channel"},
-    ],
-    "interval_minutes": 4,  # Strictly in minutes
-    "message_template_group": (
-        "প্রিয় {name}, আপনাকে হিজাবি ভিডিওগ্রুপে জয়েন হওয়ার জন্য ধন্যবাদ। ❤️\n\n"
-        "হিজাবি ভিডিওগ্রুপে ভিডিও দেখতে লিংকটি ৩টি গ্রুপে শেয়ার করুন। "
-        "৩টি গ্রুপে শেয়ার করলে ভিডিওটি আনলক হবে।"
-    ),
-    "message_template_channel": (
-        "প্রিয় {name}, আপনাকে হিজাবি ভিডিও চ্যানেলে জয়েন হওয়ার জন্য ধন্যবাদ। ❤️\n\n"
-        "হিজাবি ভিডিও চ্যানেলে ভিডিও দেখতে লিংকটি ৩টি গ্রুপে শেয়ার করুন। "
-        "৩টি গ্রুপে শেয়ার করলে ভিডিওটি আনলক হবে।"
-    ),
-    "web_user": "admin",
-    "web_pass": "admin",
-    "cron_secret": secrets.token_urlsafe(16),
+DEFAULT_STATE = {
+    "triggers": [],       
+    "targets": [],        
+    "custom_buttons": [], 
+    "last_member": "নতুন বন্ধু",
+    "last_sent_time": 0,
+    "target_msg_ids": {}, 
+    "interval": 300,      
 }
 
-DEFAULT_BUTTONS = {
-    "next_id": 3,
-    "buttons": [
-        {"id": 1, "text": "📤 শেয়ার ২/৩ করুন", "url": "{{SHARE_URL}}", "enabled": True},
-        {"id": 2, "text": "🎥 ভিডিও দেখুন", "url": "{{SHARE_URL}}", "enabled": True},
-    ],
-}
+dp = Dispatcher(storage=MemoryStorage())
+bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 
-# ============================================================
+# ======================================================================
 # JSON STORAGE
-# ============================================================
-def _atomic_write(path: str, data) -> None:
-    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".tmp_", suffix=".json")
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, path)
-
-def _read_json(path: str, default):
-    if not os.path.exists(path):
-        return default
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception as e:
-        log.warning(f"read {path}: {e}")
-        return default
-
-def load_config() -> dict:
-    cfg = _read_json(CONFIG_FILE, dict(DEFAULT_CONFIG))
-    
-    if "message_template" in cfg and "message_template_group" not in cfg:
-        cfg["message_template_group"] = cfg["message_template"]
-        cfg["message_template_channel"] = cfg["message_template"]
-    
-    if "interval_seconds" in cfg:
-        cfg["interval_minutes"] = max(1, cfg["interval_seconds"] // 60)
-        del cfg["interval_seconds"]
-        
-    if os.getenv("BOT_TOKEN"): cfg["bot_token"] = os.getenv("BOT_TOKEN")
-    if os.getenv("WEB_USER"): cfg["web_user"] = os.getenv("WEB_USER")
-    if os.getenv("WEB_PASS"): cfg["web_pass"] = os.getenv("WEB_PASS")
-    if os.getenv("CRON_SECRET"): cfg["cron_secret"] = os.getenv("CRON_SECRET")
-    return cfg
-
-def save_config(cfg: dict) -> None:
-    _atomic_write(CONFIG_FILE, cfg)
-
-def load_buttons() -> dict:
-    if not os.path.exists(BUTTONS_FILE):
-        _atomic_write(BUTTONS_FILE, DEFAULT_BUTTONS)
-        return dict(DEFAULT_BUTTONS)
-    return _read_json(BUTTONS_FILE, dict(DEFAULT_BUTTONS))
-
-def save_buttons(data: dict) -> None:
-    _atomic_write(BUTTONS_FILE, data)
-
+# ======================================================================
 def load_state() -> dict:
-    data = _read_json(STATE_FILE, {})
-    if "member_name_html" in data and "group" not in data:
-        return {"group": data["member_name_html"], "channel": ""}
-    return {
-        "group": data.get("group", ""),
-        "channel": data.get("channel", "")
-    }
-
-def save_state(state: dict) -> None:
-    try:
-        _atomic_write(STATE_FILE, state)
-    except Exception as e:
-        log.warning(f"save state: {e}")
-
-# ============================================================
-# BOT ENGINE
-# ============================================================
-bot_instance: Optional[Bot] = None
-bot_task: Optional[asyncio.Task] = None
-bot_ready = asyncio.Event()
-bot_error: Optional[str] = None
-previous_message_id: dict[int, int] = {}
-
-def make_keyboard(share_url: str) -> InlineKeyboardMarkup:
-    builder = InlineKeyboardBuilder()
-    for b in load_buttons().get("buttons", []):
-        if not b.get("enabled", True): continue
-        url = str(b.get("url", "")).replace("{{SHARE_URL}}", share_url)
-        if url:
-            builder.row(InlineKeyboardButton(text=b.get("text", "button"), url=url))
-    if not builder.export():
-        builder.row(InlineKeyboardButton(text="📤 শেয়ার ২/৩ করুন", url=share_url))
-        builder.row(InlineKeyboardButton(text="🎥 ভিডিও দেখুন", url=share_url))
-    return builder.as_markup()
-
-def make_message(template: str, name_html: str) -> str:
-    return template.replace("{name}", name_html)
-
-async def get_share_url(bot: Bot, chat_id: int) -> str:
-    try:
-        chat = await bot.get_chat(chat_id=chat_id)
-        target = chat.invite_link or f"https://t.me/c/{str(chat_id).replace('-100', '')}"
-        text = quote("হিজাবি ভিডিওগ্রুপে জয়েন করুন")
-        return f"https://t.me/share/url?url={quote(target)}&text={text}"
-    except Exception:
-        return "https://t.me/"
-
-async def replace_message_for(bot: Bot, chat_id: int, name_html: str, template: str) -> None:
-    old = previous_message_id.get(chat_id)
-    if old is not None:
-        try: 
-            await bot.delete_message(chat_id=chat_id, message_id=old)
-        except Exception: 
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                for k, v in DEFAULT_STATE.items():
+                    data.setdefault(k, v)
+                return data
+        except Exception:
             pass
-    share_url = await get_share_url(bot, chat_id)
-    try:
-        sent = await bot.send_message(
-            chat_id=chat_id,
-            text=make_message(template, name_html),
-            reply_markup=make_keyboard(share_url),
-            disable_web_page_preview=True,
-        )
-        previous_message_id[chat_id] = sent.message_id
-        log.info(f"sent promo to {chat_id} -> {sent.message_id}")
-    except Exception as exc:
-        log.error(f"Failed to send promo to {chat_id}: {exc}")
+    return dict(DEFAULT_STATE)
 
-async def refresh_all(bot: Bot):
-    cfg = load_config()
-    state = load_state()
-    tasks = []
+def save_state(state: dict):
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
+
+async def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS
+
+# ======================================================================
+# TELEGRAM BOT LOGIC
+# ======================================================================
+def build_keyboard(state: dict) -> InlineKeyboardMarkup:
+    rows = []
+    share_text = quote("হিজাবি ভিডিওগ্রুপে যোগ দিন ❤️")
+    share_url_1 = f"https://t.me/share/url?url=https://t.me/joinchat/...&text={share_text}"
+    share_url_2 = f"https://t.me/share/url?url=https://t.me/joinchat/...&text={share_text}"
     
-    if state["group"]:
-        for c in cfg.get("chats", []):
-            if c["type"] == "group" and str(c.get("id", "")).strip():
-                tasks.append(replace_message_for(bot, int(c["id"]), state["group"], cfg["message_template_group"]))
-                
-    if state["channel"]:
-        for c in cfg.get("chats", []):
-            if c["type"] == "channel" and str(c.get("id", "")).strip():
-                tasks.append(replace_message_for(bot, int(c["id"]), state["channel"], cfg["message_template_channel"]))
-                
-    if tasks:
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        for res in results:
-            if isinstance(res, Exception):
-                log.error(f"Refresh task error: {res}")
-
-def _is_join(event: ChatMemberUpdated) -> bool:
-    return event.old_chat_member.status in ("left", "kicked") and event.new_chat_member.status == "member"
-
-async def new_member_handler(event: ChatMemberUpdated, bot: Bot):
-    cfg = load_config()
-    chat_conf = next((c for c in cfg["chats"] if str(c.get("id")) == str(event.chat.id)), None)
+    rows.append([
+        InlineKeyboardButton(text="📤 শেয়ার করুন ১", url=share_url_1),
+        InlineKeyboardButton(text="📤 শেয়ার করুন ২", url=share_url_2)
+    ])
     
-    if not chat_conf or not _is_join(event):
-        return
+    for b in state.get("custom_buttons", []):
+        rows.append([InlineKeyboardButton(text=b["text"], url=b["url"])])
         
-    state = load_state()
-    user = event.new_chat_member.user
-    name_html = f'<a href="tg://user?id={user.id}">{html.escape(user.full_name)}</a>'
-    
-    if chat_conf["type"] == "group":
-        state["group"] = name_html
-        save_state(state)
-        log.info(f"New group member: {user.full_name}")
-        for c in cfg["chats"]:
-            if c["type"] == "group" and str(c.get("id", "")).strip():
-                await replace_message_for(bot, int(c["id"]), name_html, cfg["message_template_group"])
-                
-    elif chat_conf["type"] == "channel":
-        state["channel"] = name_html
-        save_state(state)
-        log.info(f"New channel member: {user.full_name}")
-        for c in cfg["chats"]:
-            if c["type"] == "channel" and str(c.get("id", "")).strip():
-                await replace_message_for(bot, int(c["id"]), name_html, cfg["message_template_channel"])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
-async def refresh_loop(bot: Bot) -> None:
+async def post_to_targets(bot: Bot, member_name: str):
+    state = load_state()
+    targets = state.get("targets", [])
+    if not targets: return
+        
+    msg_text = (
+        f"নতুন সদস্য {member_name} যোগদান করেছেন! ❤️\n\n"
+        "ভিডিও দেখতে নিচের লিংকটি ৩টি গ্রুপে শেয়ার করুন।"
+    )
+    keyboard = build_keyboard(state)
+    
+    for chat_id in targets:
+        old_msg_id = state["target_msg_ids"].get(str(chat_id))
+        if old_msg_id:
+            try: await bot.delete_message(chat_id=chat_id, message_id=old_msg_id)
+            except TelegramAPIError: pass
+                
+        try:
+            sent = await bot.send_message(chat_id=chat_id, text=msg_text, reply_markup=keyboard)
+            state["target_msg_ids"][str(chat_id)] = sent.message_id
+        except TelegramAPIError as e:
+            log.error(f"Failed to send to {chat_id}: {e}")
+            
+    state["last_member"] = member_name
+    state["last_sent_time"] = int(time.time())
+    save_state(state)
+
+# --- AUTO SEND & AUTO BACKUP LOOPS ---
+async def auto_sender_task():
     while True:
-        try:
-            cfg = load_config()
-            minutes = max(1, int(cfg.get("interval_minutes", 4)))
-            await asyncio.sleep(minutes * 60)
-            
-            state = load_state()
-            if state["group"] or state["channel"]:
-                log.info(f"Internal interval reached ({minutes} min). Refreshing messages...")
-                await refresh_all(bot)
-                
-        except asyncio.CancelledError:
-            log.info("Refresh loop cancelled.")
-            break
-        except Exception as exc:
-            log.error(f"refresh_loop error: {exc}")
-            await asyncio.sleep(5)
-
-async def _run_bot_logic(token: str):
-    global bot_ready, bot_error, bot_instance
-    try:
-        bot_instance = Bot(token=token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-        dp = Dispatcher()
-        dp.chat_member.register(new_member_handler)
-        
-        me = await bot_instance.get_me()
-        log.info(f"Bot @{me.username} started successfully.")
-        bot_ready.set()
-        bot_error = None
-        
+        await asyncio.sleep(30)
         state = load_state()
-        if state["group"] or state["channel"]:
-            await refresh_all(bot_instance)
-            
-        await asyncio.gather(
-            dp.start_polling(bot_instance, allowed_updates=["chat_member"], handle_signals=False),
-            refresh_loop(bot_instance)
-        )
-    except asyncio.CancelledError:
-        log.info("Bot logic shut down gracefully.")
-    except Exception as exc:
-        bot_error = f"Startup failed: {exc}"
-        bot_ready.clear()
-        log.error(f"Bot crashed: {exc}")
-    finally:
-        if bot_instance:
-            await bot_instance.session.close()
+        now = int(time.time())
+        if (now - state["last_sent_time"]) >= state["interval"]:
+            if state["targets"]:
+                await post_to_targets(bot, state["last_member"])
 
-async def start_bot_async():
-    global bot_task, bot_error, bot_ready
-    
-    if bot_task and not bot_task.done():
-        bot_task.cancel()
-        try:
-            # Short wait to allow the previous bot instance to properly release the Telegram connection
-            await asyncio.sleep(1.5)
-        except asyncio.CancelledError:
-            pass
-            
-    bot_ready.clear()
-    bot_error = None
-    
-    token = load_config().get("bot_token", "").strip()
-    if not token:
-        bot_error = "Bot Token is missing. Please enter it above and click Save."
-        log.error(bot_error)
-        return
+async def auto_backup_task():
+    while True:
+        await asyncio.sleep(3600) # Wait 1 hour (3600 seconds)
+        state = load_state()
+        backup_data = json.dumps(state, indent=2).encode('utf-8')
+        doc = BufferedInputFile(backup_data, filename="bot_state.json")
         
-    bot_task = asyncio.create_task(_run_bot_logic(token))
+        for admin_id in ADMIN_IDS:
+            try:
+                await bot.send_document(
+                    chat_id=admin_id, 
+                    document=doc, 
+                    caption="🕒 <b>Hourly Auto-Backup</b>\nIf Render restarts, just forward this file back to me to restore your settings!"
+                )
+            except TelegramAPIError as e:
+                log.error(f"Failed to send backup to {admin_id}: {e}")
 
+# --- NEW MEMBER TRIGGER ---
+@dp.chat_member(ChatMemberUpdatedFilter(member_status_changed=IS_NOT_MEMBER >> IS_MEMBER))
+async def on_new_member(event: ChatMemberUpdated):
+    if event.new_chat_member.user.is_bot: return
+    state = load_state()
+    if event.chat.id not in state["triggers"]: return
+    
+    name_html = f'<a href="tg://user?id={event.new_chat_member.user.id}">{escape(event.new_chat_member.user.full_name)}</a>'
+    await post_to_targets(event.bot, name_html)
+
+# --- MANUAL RESTORE SYSTEM ---
+@dp.message(F.document)
+async def restore_backup(message: Message):
+    if not await is_admin(message.from_user.id): return
+    if not message.document.file_name.endswith('.json'): return
+        
+    try:
+        # Download the sent file into memory
+        file_in_memory = io.BytesIO()
+        await bot.download(message.document, destination=file_in_memory)
+        file_in_memory.seek(0)
+        
+        # Parse it and overwrite local state
+        new_state = json.load(file_in_memory)
+        
+        # Ensure default keys exist in case of old backup format
+        for k, v in DEFAULT_STATE.items():
+            new_state.setdefault(k, v)
+            
+        save_state(new_state)
+        await message.answer("✅ <b>Backup restored successfully!</b>\nAll Triggers, Targets, and Buttons are back.")
+    except Exception as e:
+        await message.answer(f"❌ <b>Error restoring backup:</b>\n{e}")
+
+# ======================================================================
+# FASTAPI WEB DASHBOARD & API
+# ======================================================================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Run on startup
-    await start_bot_async()
-    yield
-    # Run on shutdown
-    if bot_task and not bot_task.done():
-        bot_task.cancel()
-    if bot_instance:
-        await bot_instance.session.close()
-
-# ============================================================
-# WEB UI & AUTH
-# ============================================================
-SESSIONS = set()
-COOKIE = "tgn_session"
-app = FastAPI(title="TG Join Noti", lifespan=lifespan)
-
-def _authed(req: Request) -> bool:
-    return req.cookies.get(COOKIE) in SESSIONS
-
-CSS = """
-<style>
-  :root { --bg:#f8fafc; --card:#fff; --ink:#0f172a; --muted:#64748b; --brand:#2563eb; --danger:#ef4444; --ok:#22c55e; }
-  * { box-sizing:border-box; }
-  body { margin:0; background:var(--bg); color:var(--ink); font-family:system-ui,sans-serif; line-height:1.5; }
-  .wrap { max-width:960px; margin:0 auto; padding:2rem 1rem; }
-  h1 { margin:0 0 .25rem; font-size:1.5rem; }
-  .topbar { display:flex; justify-content:space-between; align-items:center; margin-bottom:1.5rem; }
-  .badge { padding:.2rem .6rem; border-radius:99px; font-size:.75rem; font-weight:700; }
-  .badge.ok { background:#dcfce7; color:#166534; }
-  .badge.bad { background:#fee2e2; color:#991b1b; }
-  section { background:var(--card); border-radius:12px; padding:1.5rem; margin-bottom:1.5rem; box-shadow:0 4px 6px -1px rgb(0 0 0 / 0.05); animation:rise .4s ease-out; }
-  @keyframes rise { from { opacity:0; transform:translateY(15px); } to { opacity:1; transform:translateY(0); } }
-  label { display:block; font-weight:600; margin:1rem 0 .4rem; font-size:.9rem; }
-  input[type=text], input[type=number], input[type=password], textarea, select { width:100%; padding:.65rem; border:1px solid #cbd5e1; border-radius:8px; font:inherit; transition:.2s; }
-  input:focus, textarea:focus, select:focus { outline:none; border-color:var(--brand); box-shadow:0 0 0 3px rgba(37,99,235,.15); }
-  textarea { min-height:100px; resize:vertical; }
-  .chat-row { display:flex; gap:.5rem; margin-bottom:.5rem; }
-  .chat-row input { flex:1; }
-  .chat-row select { width:120px; flex-shrink:0; }
-  button { padding:.6rem 1.2rem; border:0; border-radius:8px; background:var(--brand); color:#fff; cursor:pointer; font:inherit; font-weight:600; transition:.15s; }
-  button:hover { filter:brightness(1.1); }
-  button:active { transform:scale(.96); }
-  button.danger { background:var(--danger); }
-  button.ghost { background:#e2e8f0; color:#334155; }
-  button.small { padding:.35rem .75rem; font-size:.85rem; }
-  .btn-card { border:1px solid #e2e8f0; border-radius:10px; padding:1rem; margin-bottom:1rem; animation:pop .3s ease-out; }
-  @keyframes pop { from { opacity:0; transform:scale(.98); } to { opacity:1; transform:scale(1); } }
-  .actions { display:flex; gap:.5rem; flex-wrap:wrap; margin-top:1rem; }
-  table { width:100%; border-collapse:collapse; background:var(--card); border-radius:10px; overflow:hidden; }
-  th, td { padding:.75rem 1rem; border-bottom:1px solid #e2e8f0; text-align:left; font-size:.9rem; }
-  th { background:#f1f5f9; font-weight:600; }
-  .toast-wrap { position:fixed; bottom:20px; right:20px; display:flex; flex-direction:column; gap:10px; z-index:100; }
-  .toast { background:#0f172a; color:#fff; padding:.75rem 1rem; border-radius:8px; font-size:.9rem; box-shadow:0 10px 15px -3px rgba(0,0,0,.1); animation:slideIn .3s ease-out; }
-  @keyframes slideIn { from { opacity:0; transform:translateX(20px); } to { opacity:1; transform:translateX(0); } }
-  .cron-box { background:#f1f5f9; padding:.75rem; border-radius:8px; font-family:monospace; word-break:break-all; display:flex; justify-content:space-between; align-items:center; margin-top:.5rem;}
-</style>
-"""
-
-JS = """
-<script>
-  function toast(msg) {
-    const w = document.getElementById('toasts');
-    const el = document.createElement('div');
-    el.className = 'toast';
-    el.textContent = msg;
-    w.appendChild(el);
-    setTimeout(()=>{ el.style.opacity='0'; el.style.transition='.3s'; setTimeout(()=>el.remove(), 300); }, 2500);
-  }
-  function copyCron() {
-    const txt = document.getElementById('cron-url').innerText;
-    navigator.clipboard.writeText(txt).then(() => toast('📋 Copied to clipboard!'));
-  }
-  const params = new URLSearchParams(location.search);
-  if (params.has('saved')) toast('✅ Saved config');
-  if (params.has('deleted')) toast('🗑 Deleted');
-  if (params.has('added')) toast('➕ Added');
-</script>
-"""
-
-def render_page(status: str, body: str) -> str:
-    return f"""<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>TG Join Noti — Admin</title>
-{CSS}
-</head><body>
-<div class="wrap">
-  <div class="topbar">
-    <div>
-      <h1>TG Join Noti</h1>
-      <div style="font-size:.85rem;color:var(--muted);margin-top:.5rem">Status: {status}</div>
-    </div>
-    <div class="actions">
-      <a href="/health"><button type="button" class="ghost">📊 Health</button></a>
-      <form method="post" action="/logout" style="margin:0"><button type="submit" class="ghost">Logout</button></form>
-    </div>
-  </div>
-  {body}
-</div>
-<div class="toast-wrap" id="toasts"></div>
-{JS}
-</body></html>"""
-
-def _status_html():
-    if bot_error: 
-        return f'<span class="badge bad">Error: {html.escape(bot_error)}</span>'
-    if bot_ready.is_set(): 
-        return '<span class="badge ok">Running</span>'
-    return '<span class="badge bad">Not Started</span>'
-
-@app.get("/login", response_class=HTMLResponse)
-async def login_page(err: Optional[str] = None):
-    body = f"""<section style="max-width:400px;margin:5rem auto;">
-      <h2>Login</h2>
-      {'<p style="color:red;font-weight:bold;">Wrong password</p>' if err else ''}
-      <form method="post" action="/login">
-        <label>Username</label>
-        <input type="text" name="user" required>
-        <label>Password</label>
-        <input type="password" name="pw" required>
-        <div class="actions"><button type="submit">Login</button></div>
-      </form>
-    </section>"""
-    return render_page(_status_html(), body)
-
-@app.post("/login")
-async def do_login(user: str = Form(...), pw: str = Form(...)):
-    cfg = load_config()
-    if user == cfg.get("web_user") and pw == cfg.get("web_pass"):
-        token = secrets.token_urlsafe(24)
-        SESSIONS.add(token)
-        resp = RedirectResponse("/", status_code=303)
-        resp.set_cookie(COOKIE, token, httponly=True)
-        return resp
-    return RedirectResponse("/login?err=1", status_code=303)
-
-@app.post("/logout")
-async def logout(req: Request):
-    SESSIONS.discard(req.cookies.get(COOKIE))
-    resp = RedirectResponse("/login", status_code=303)
-    resp.delete_cookie(COOKIE)
-    return resp
-
-@app.get("/api/cron")
-async def api_cron(secret: str = ""):
-    cfg = load_config()
-    if not secret or secret != cfg.get("cron_secret"):
-        return JSONResponse({"status": "error", "msg": "Invalid secret"}, status_code=403)
-    if bot_instance and bot_ready.is_set():
-        asyncio.create_task(refresh_all(bot_instance))
-        return {"status": "success", "msg": "Refresh triggered"}
-    return JSONResponse({"status": "error", "msg": "Bot is not running"}, status_code=400)
-
-@app.get("/", response_class=HTMLResponse)
-async def index(req: Request):
-    if not _authed(req): return RedirectResponse("/login", status_code=303)
-    cfg = load_config()
+    await bot.delete_webhook(drop_pending_updates=True) 
     
-    chat_rows = "".join(
-        f"""<div class="chat-row">
-          <input type="text" name="chat_id" value="{html.escape(str(c.get('id','')))}" placeholder="-100...">
-          <select name="chat_type">
-            <option value="group" {'selected' if c.get('type')=='group' else ''}>group</option>
-            <option value="channel" {'selected' if c.get('type')=='channel' else ''}>channel</option>
-          </select>
-        </div>""" for c in cfg.get("chats", [])
-    )
+    polling_task = asyncio.create_task(dp.start_polling(bot))
+    sender_task = asyncio.create_task(auto_sender_task())
+    backup_task = asyncio.create_task(auto_backup_task())
+    
+    yield 
+    
+    polling_task.cancel()
+    sender_task.cancel()
+    backup_task.cancel()
+    await bot.session.close()
 
-    btn_cards = "".join(
-        f"""<form class="btn-card" method="post" action="/buttons/update/{b['id']}">
-          <div style="display:flex;gap:.5rem;">
-            <input type="text" name="text" value="{html.escape(b['text'])}" style="flex:1;">
-            <input type="text" name="url" value="{html.escape(b['url'])}" style="flex:2;">
-            <label style="margin:0;display:flex;align-items:center;"><input type="checkbox" name="enabled" {'checked' if b.get('enabled',True) else ''}> On</label>
-          </div>
-          <div class="actions">
-            <button type="submit" class="small">Save</button>
-            <button type="submit" formaction="/buttons/delete/{b['id']}" class="danger small" onclick="return confirm('Delete?')">Delete</button>
-          </div>
-        </form>""" for b in load_buttons().get("buttons", [])
-    )
+app = FastAPI(lifespan=lifespan)
 
-    base_url = str(req.base_url).rstrip("/")
-    cron_url = f"{base_url}/api/cron?secret={cfg.get('cron_secret')}"
+@app.get("/health")
+async def health_check():
+    return {"status": "online"}
 
-    is_env_token = bool(os.getenv("BOT_TOKEN"))
-    token_input = f'''
-        <input type="text" name="bot_token" value="{"********" if is_env_token else html.escape(cfg.get('bot_token',''))}" placeholder="123456:ABC..." {"disabled" if is_env_token else ""}>
-        {f'<div style="font-size:.8rem;color:var(--ok);margin-top:.2rem">✅ Token is being loaded from environment variable</div>' if is_env_token else ''}
-    '''
+@app.get("/api/state")
+async def api_get_state(secret: str = ""):
+    if secret != ADMIN_SECRET: raise HTTPException(403, "Unauthorized")
+    return load_state()
 
-    body = f"""
-    <section>
-      <h2>Bot & Chats</h2>
-      <form method="post" action="/config">
-        <label>Bot Token</label>
-        {token_input}
+@app.post("/api/state")
+async def api_save_state(request: Request, secret: str = ""):
+    if secret != ADMIN_SECRET: raise HTTPException(403, "Unauthorized")
+    data = await request.json()
+    
+    state = load_state()
+    state["triggers"] = [int(x) for x in data.get("triggers", []) if str(x).strip()]
+    state["targets"] = [int(x) for x in data.get("targets", []) if str(x).strip()]
+    state["interval"] = int(data.get("interval", 300))
+    state["custom_buttons"] = data.get("custom_buttons", [])
+    save_state(state)
+    return {"ok": True}
+
+@app.get("/admin", response_class=HTMLResponse)
+async def admin_ui(secret: str = ""):
+    if secret != ADMIN_SECRET:
+        return HTMLResponse("<h1>Unauthorized. Check your secret in the URL.</h1>", status_code=403)
         
-        <label>Chats (Group / Channel IDs)</label>
-        {chat_rows}
-        <button type="submit" formaction="/chats/add" class="ghost small" style="margin-top:.5rem;">+ Add another chat</button>
-        
-        <label>Internal Refresh Interval (Minutes)</label>
-        <input type="number" name="interval_minutes" value="{cfg.get('interval_minutes', 4)}" min="1">
-        
-        <label>Group Message Template (use <code>{{name}}</code>)</label>
-        <textarea name="message_template_group">{html.escape(cfg.get('message_template_group',''))}</textarea>
-        
-        <label>Channel Message Template (use <code>{{name}}</code>)</label>
-        <textarea name="message_template_channel">{html.escape(cfg.get('message_template_channel',''))}</textarea>
-        
-        <div class="actions"><button type="submit">Save Config & Restart Bot</button></div>
-      </form>
-    </section>
-
-    <section>
-      <h2>External Cronjob</h2>
-      <p style="color:var(--muted);font-size:.9rem;">Ping this URL every 30 minutes to keep the message active.</p>
-      <div class="cron-box">
-        <span id="cron-url">{cron_url}</span>
-        <button type="button" class="ghost small" onclick="copyCron()">Copy</button>
-      </div>
-    </section>
-
-    <section>
-      <h2>Buttons</h2>
-      <p style="color:var(--muted);font-size:.9rem;">Use <code>{{SHARE_URL}}</code> in a link to substitute the group invite link.</p>
-      {btn_cards}
-      <form method="post" action="/buttons/add" class="btn-card">
-        <div style="display:flex;gap:.5rem;">
-          <input type="text" name="text" placeholder="Button Text" required style="flex:1;">
-          <input type="text" name="url" placeholder="https://... or {{SHARE_URL}}" required style="flex:2;">
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Bot Web Dashboard</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
+</head>
+<body class="bg-gray-900 text-gray-100 p-4 md:p-8">
+    <div id="app" class="max-w-3xl mx-auto">
+        <div class="flex justify-between items-center mb-8 border-b border-gray-700 pb-4">
+            <h1 class="text-3xl font-bold text-blue-400">🤖 Bot Dashboard</h1>
+            <button @click="saveConfig" class="bg-blue-600 hover:bg-blue-500 text-white px-6 py-2 rounded-lg font-semibold transition">
+                {{{{ saving ? 'Saving...' : 'Save Settings' }}}}
+            </button>
         </div>
-        <div class="actions"><button type="submit" class="small">Add Button</button></div>
-      </form>
-    </section>"""
-    return render_page(_status_html(), body)
 
-@app.post("/config")
-async def post_config(req: Request, bot_token: str = Form(""), interval_minutes: int = Form(4), message_template_group: str = Form(""), message_template_channel: str = Form(""), chat_id: list[str] = Form([]), chat_type: list[str] = Form([])):
-    if not _authed(req): return RedirectResponse("/login", status_code=303)
-    cfg = load_config()
-    old_token = cfg.get("bot_token", "")
-    
-    if not os.getenv("BOT_TOKEN"):
-        cfg["bot_token"] = bot_token.strip()
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-6 mb-8">
+            <div class="bg-gray-800 p-6 rounded-xl border border-gray-700">
+                <h2 class="text-xl font-semibold mb-2">🎯 Trigger Channels</h2>
+                <p class="text-gray-400 text-sm mb-4">Chat IDs where users join.</p>
+                <div v-for="(t, idx) in config.triggers" :key="'trig'+idx" class="flex gap-2 mb-2">
+                    <input v-model="config.triggers[idx]" class="bg-gray-900 border border-gray-600 rounded px-3 py-2 w-full text-white" type="text" placeholder="-100123456789">
+                    <button @click="config.triggers.splice(idx, 1)" class="bg-red-600/80 hover:bg-red-500 px-3 rounded text-white">X</button>
+                </div>
+                <button @click="config.triggers.push('')" class="text-blue-400 hover:text-blue-300 text-sm mt-2 font-medium">+ Add Trigger ID</button>
+            </div>
+
+            <div class="bg-gray-800 p-6 rounded-xl border border-gray-700">
+                <h2 class="text-xl font-semibold mb-2">📢 Target Groups</h2>
+                <p class="text-gray-400 text-sm mb-4">Chat IDs where bot sends links.</p>
+                <div v-for="(t, idx) in config.targets" :key="'targ'+idx" class="flex gap-2 mb-2">
+                    <input v-model="config.targets[idx]" class="bg-gray-900 border border-gray-600 rounded px-3 py-2 w-full text-white" type="text" placeholder="-100123456789">
+                    <button @click="config.targets.splice(idx, 1)" class="bg-red-600/80 hover:bg-red-500 px-3 rounded text-white">X</button>
+                </div>
+                <button @click="config.targets.push('')" class="text-blue-400 hover:text-blue-300 text-sm mt-2 font-medium">+ Add Target ID</button>
+            </div>
+        </div>
+
+        <div class="bg-gray-800 p-6 rounded-xl border border-gray-700 mb-8">
+            <h2 class="text-xl font-semibold mb-2">🔗 Custom URL Buttons</h2>
+            <p class="text-gray-400 text-sm mb-4">These appear below the 2 fixed share buttons.</p>
+            <div v-for="(btn, idx) in config.custom_buttons" :key="'btn'+idx" class="flex flex-col md:flex-row gap-2 mb-3 bg-gray-900/50 p-3 rounded border border-gray-700">
+                <input v-model="btn.text" class="bg-gray-900 border border-gray-600 rounded px-3 py-2 w-full md:w-1/3 text-white" type="text" placeholder="Button Name">
+                <input v-model="btn.url" class="bg-gray-900 border border-gray-600 rounded px-3 py-2 w-full md:w-2/3 text-white" type="text" placeholder="https://t.me/...">
+                <button @click="config.custom_buttons.splice(idx, 1)" class="bg-red-600/80 hover:bg-red-500 px-3 py-2 md:py-0 rounded text-white">Remove</button>
+            </div>
+            <button @click="config.custom_buttons.push({{text: '', url: ''}})" class="text-blue-400 hover:text-blue-300 text-sm font-medium">+ Add Button</button>
+        </div>
+
+        <div class="bg-gray-800 p-6 rounded-xl border border-gray-700">
+            <h2 class="text-xl font-semibold mb-4">⚙️ Auto-Send Settings</h2>
+            <label class="block text-sm text-gray-400 mb-1">Cooldown Interval (Seconds)</label>
+            <input v-model="config.interval" class="bg-gray-900 border border-gray-600 rounded px-3 py-2 w-full md:w-1/3 text-white" type="number" min="30">
+        </div>
         
-    cfg["interval_minutes"] = max(1, interval_minutes)
-    cfg["message_template_group"] = message_template_group
-    cfg["message_template_channel"] = message_template_channel
-    cfg["chats"] = [{"id": cid.strip(), "type": ctype} for cid, ctype in zip(chat_id, chat_type) if cid.strip()] or [{"id": "", "type": "group"}]
-    save_config(cfg)
-    
-    if old_token != cfg["bot_token"] or not bot_ready.is_set():
-        asyncio.create_task(start_bot_async())
-        
-    return RedirectResponse("/?saved=1", status_code=303)
+        <div v-if="toast" class="fixed bottom-4 right-4 bg-green-600 text-white px-6 py-3 rounded shadow-lg transition-opacity duration-300">
+            ✅ Settings Saved Successfully!
+        </div>
+    </div>
 
-@app.post("/chats/add")
-async def add_chat(req: Request):
-    if not _authed(req): return RedirectResponse("/login", status_code=303)
-    cfg = load_config()
-    cfg["chats"].append({"id": "", "type": "group"})
-    save_config(cfg)
-    return RedirectResponse("/?added=1", status_code=303)
+    <script>
+        const secret = "{secret}";
+        const {{ createApp }} = Vue;
 
-@app.post("/buttons/add")
-async def add_button(req: Request, text: str = Form(...), url: str = Form(...)):
-    if not _authed(req): return RedirectResponse("/login", status_code=303)
-    data = load_buttons()
-    data["buttons"].append({"id": data.get("next_id", 1), "text": text.strip(), "url": url.strip(), "enabled": True})
-    data["next_id"] = data.get("next_id", 1) + 1
-    save_buttons(data)
-    return RedirectResponse("/?added=1", status_code=303)
+        createApp({{
+            data() {{
+                return {{
+                    config: {{ triggers: [], targets: [], custom_buttons: [], interval: 300 }},
+                    saving: false,
+                    toast: false
+                }}
+            }},
+            async mounted() {{
+                const res = await fetch('/api/state?secret=' + secret);
+                if(res.ok) {{
+                    const data = await res.json();
+                    this.config.triggers = data.triggers || [];
+                    this.config.targets = data.targets || [];
+                    this.config.custom_buttons = data.custom_buttons || [];
+                    this.config.interval = data.interval || 300;
+                }}
+            }},
+            methods: {{
+                async saveConfig() {{
+                    this.saving = true;
+                    await fetch('/api/state?secret=' + secret, {{
+                        method: 'POST',
+                        headers: {{ 'Content-Type': 'application/json' }},
+                        body: JSON.stringify(this.config)
+                    }});
+                    this.saving = false;
+                    this.showToast();
+                }},
+                showToast() {{
+                    this.toast = true;
+                    setTimeout(() => this.toast = false, 3000);
+                }}
+            }}
+        }}).mount('#app')
+    </script>
+</body>
+</html>"""
 
-@app.post("/buttons/update/{bid}")
-async def update_button(req: Request, bid: int, text: str = Form(...), url: str = Form(...), enabled: Optional[str] = Form(None)):
-    if not _authed(req): return RedirectResponse("/login", status_code=303)
-    data = load_buttons()
-    for b in data["buttons"]:
-        if b["id"] == bid:
-            b["text"], b["url"], b["enabled"] = text.strip(), url.strip(), enabled == "on"
-            break
-    save_buttons(data)
-    return RedirectResponse("/?saved=1", status_code=303)
-
-@app.post("/buttons/delete/{bid}")
-async def delete_button(req: Request, bid: int):
-    if not _authed(req): return RedirectResponse("/login", status_code=303)
-    data = load_buttons()
-    data["buttons"] = [b for b in data["buttons"] if b["id"] != bid]
-    save_buttons(data)
-    return RedirectResponse("/?deleted=1", status_code=303)
-
-@app.get("/health", response_class=HTMLResponse)
-async def health(req: Request):
-    if not _authed(req): return RedirectResponse("/login", status_code=303)
-    cfg = load_config()
-    rows = ""
-    if not cfg.get("bot_token"): 
-        rows = '<tr><td colspan="5">No token</td></tr>'
-    else:
-        b = Bot(token=cfg["bot_token"])
-        for c in cfg.get("chats", []):
-            cid = c.get("id")
-            if not cid: continue
-            try:
-                chat = await b.get_chat(chat_id=int(cid))
-                me = await b.get_me()
-                m = await b.get_chat_member(chat_id=int(cid), user_id=me.id)
-                adm = '<span class="badge ok">Yes</span>' if m.status in ("administrator", "creator") else '<span class="badge bad">No</span>'
-                rows += f"<tr><td>{chat.title}</td><td><code>{cid}</code></td><td>{chat.type}</td><td>{getattr(chat,'member_count','—')}</td><td>{adm}</td></tr>"
-            except Exception as e:
-                rows += f"<tr><td>Error</td><td><code>{cid}</code></td><td colspan='3' style='color:red'>{html.escape(str(e))}</td></tr>"
-        await b.session.close()
-        
-    body = f"""<section>
-      <p><a href="/">← Back to Dashboard</a></p>
-      <table><tr><th>Title</th><th>ID</th><th>Type</th><th>Members</th><th>Bot is Admin?</th></tr>{rows}</table>
-    </section>"""
-    return render_page(_status_html(), body)
-
-# ============================================================
-# STARTUP
-# ============================================================
 if __name__ == "__main__":
-    if not os.path.exists(CONFIG_FILE): save_config(dict(DEFAULT_CONFIG))
-    if not os.path.exists(BUTTONS_FILE): save_buttons(dict(DEFAULT_BUTTONS))
-
     import uvicorn
-    # Render assigns the port dynamically
-    port = int(os.environ.get("PORT", 8080))
-    uvicorn.run("main:app", host="0.0.0.0", port=port, log_level="info")
+    uvicorn.run("main:app", host="0.0.0.0", port=PORT, log_level="info")
